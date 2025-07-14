@@ -1,0 +1,801 @@
+"""
+Pipeline Worker - 图像处理流程工作器
+负责接收任务、提交sbatch作业、监控状态并与hndb api交互
+
+新增功能:
+- UploadFileWatcher: 监控cfg.ImageRootDirectory路径下的.h5文件上传
+  * 实时监控指定目录下的.h5文件变化
+  * 检测文件创建和移动事件
+  * 等待文件上传完成（通过文件大小稳定性检查）
+  * 自动通知core server有新文件上传
+"""
+
+import os
+import sys
+import time
+import json
+import asyncio
+import subprocess
+import logging
+import httpx
+from datetime import datetime
+from typing import Dict, Optional, List
+from dataclasses import dataclass
+from enum import Enum as PyEnum
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel
+import uvicorn
+import config as cfg
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('pipeline_worker.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class StartStepRequest(BaseModel):
+    """开始步骤请求模型"""
+    pipeline_id: str
+    step_name: str
+    h5_image_name: str
+
+class StepStatusEnum(str, PyEnum):
+    """步骤状态枚举"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+def map_slurm_status_to_step_status(slurm_status: str) -> str:
+    """将 SLURM 状态映射到步骤状态"""
+    slurm_to_step_mapping = {
+        "PENDING": StepStatusEnum.PENDING.value,
+        "RUNNING": StepStatusEnum.RUNNING.value,
+        "COMPLETED": StepStatusEnum.COMPLETED.value,
+        "FAILED": StepStatusEnum.FAILED.value,
+        "CANCELLED": StepStatusEnum.FAILED.value,
+        "TIMEOUT": StepStatusEnum.FAILED.value,
+        "NODE_FAIL": StepStatusEnum.FAILED.value,
+        "OUT_OF_MEMORY": StepStatusEnum.FAILED.value,
+        "UNKNOWN": StepStatusEnum.FAILED.value,
+        "ERROR": StepStatusEnum.FAILED.value
+    }
+    
+    return slurm_to_step_mapping.get(slurm_status, StepStatusEnum.FAILED.value)
+
+@dataclass
+class JobInfo:
+    """作业信息"""
+    job_id: str
+    pipeline_id: str
+    step_name: str
+    submit_time: datetime
+    last_check_time: datetime
+    status: str = "PENDING"
+
+class PipelineWorker:
+    """Pipeline Worker 主类"""
+    
+    def __init__(self, 
+                 core_server_url: str = "http://localhost:8000",
+                 worker_id: Optional[str] = None,
+                 heartbeat_interval: int = 30,
+                 job_check_interval: int = 10,
+                 convert_temp_path: Optional[str] = None,
+                 archive_prepare_path: Optional[str] = None,
+                 hndb_archive_path: Optional[str] = None):
+        self.core_server_url = core_server_url.rstrip('/')
+        self.worker_id = worker_id or f"worker_{os.getpid()}"
+        self.heartbeat_interval = heartbeat_interval
+        self.job_check_interval = job_check_interval
+        self.convert_temp_path = convert_temp_path
+        self.archive_prepare_path = archive_prepare_path
+        self.hndb_archive_path = hndb_archive_path
+        
+        # 存储正在运行的作业
+        self.running_jobs: Dict[str, JobInfo] = {}
+        
+        # HTTP 客户端
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+        
+        # 工作状态
+        self.is_running = True
+        
+        logger.info(f"Pipeline Worker 初始化完成，Worker ID: {self.worker_id}")
+
+    async def start_step(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> dict:
+        """开始执行处理步骤"""
+        try:
+            logger.info(f"开始执行步骤: {pipeline_id}/{step_name}")
+            
+            # 检查是否已有该步骤在运行
+            job_key = f"{pipeline_id}_{step_name}"
+            if job_key in self.running_jobs:
+                logger.warning(f"步骤 {pipeline_id}/{step_name} 已在运行中")
+                return {"status": "already_running", "job_id": self.running_jobs[job_key].job_id}
+            
+            # 提交 sbatch 作业
+            job_id = await self._submit_sbatch_job(pipeline_id, step_name, h5_image_name)
+            
+            if job_id:
+                # 记录作业信息
+                job_info = JobInfo(
+                    job_id=job_id,
+                    pipeline_id=pipeline_id,
+                    step_name=step_name,
+                    submit_time=datetime.now(),
+                    last_check_time=datetime.now()
+                )
+                self.running_jobs[job_key] = job_info
+                
+                # 通知 core_server_api 步骤已开始
+                await self._notify_step_started(pipeline_id, step_name, job_id)
+                
+                logger.info(f"作业提交成功: {job_id} for {pipeline_id}/{step_name}")
+                return {"status": "submitted", "job_id": job_id}
+            else:
+                error_msg = f"作业提交失败: {pipeline_id}/{step_name}"
+                logger.error(error_msg)
+                # 通知步骤失败
+                await self._notify_step_failed(pipeline_id, step_name, error_msg)
+                return {"status": "failed", "error": "作业提交失败"}
+                
+        except Exception as e:
+            logger.error(f"开始步骤时发生错误: {e}")
+            await self._notify_step_failed(pipeline_id, step_name, str(e))
+            return {"status": "error", "error": str(e)}
+    
+    async def _submit_sbatch_job(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> Optional[str]:
+        """提交 sbatch 作业"""
+        try:
+            # 根据步骤名称选择对应的处理脚本
+            script_mapping = {
+                "mip_generation": "pipeline_stage_h5_to_mip.py",
+                "h5_to_v3draw": "pipeline_stage_h5_to_v3draw.py",
+                "bit_conversion": "pipeline_stage_16bit_to_8bit.py",
+                "downsample": "pipeline_stage_8bit_downsample.py",
+                "cell_crop_generation": "pipeline_stage_cell_crop_generation.py",
+            }
+            
+            script_file = script_mapping.get(step_name)
+            if not script_file:
+                raise ValueError(f"未知的步骤名称: {step_name}")
+            
+            # 检查脚本文件是否存在
+            script_path = os.path.join(os.path.dirname(__file__), script_file)
+            if not os.path.exists(script_path):
+                raise FileNotFoundError(f"处理脚本不存在: {script_path}")
+            
+            # 构建 sbatch 命令
+            sbatch_script = self._generate_sbatch_script(pipeline_id, step_name, script_path, h5_image_name)
+            
+            # 写入临时脚本文件
+            temp_script_path = f"/tmp/sbatch_{pipeline_id}_{step_name}_{int(time.time())}.sh"
+            with open(temp_script_path, 'w') as f:
+                f.write(sbatch_script)
+            
+            # 提交作业
+            cmd = ["sbatch", temp_script_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            # 解析作业ID
+            output = result.stdout.strip()
+            if "Submitted batch job" in output:
+                job_id = output.split()[-1]
+                logger.info(f"Sbatch 作业提交成功: {job_id}")
+                return job_id
+            else:
+                logger.error(f"无法解析作业ID: {output}")
+                return None
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Sbatch 命令执行失败: {e.stderr}")
+            return None
+        except Exception as e:
+            logger.error(f"提交 sbatch 作业时发生错误: {e}")
+            return None
+    
+    def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, h5_image_name: Optional[str] = None) -> str:
+        """生成 sbatch 脚本内容"""
+        image_path = os.path.join(cfg.ImageRootDirectory, h5_image_name if h5_image_name else "") 
+
+        return f"""#!/bin/bash
+#SBATCH --job-name={step_name}_{pipeline_id}
+#SBATCH --output=/tmp/slurm_%j.out
+#SBATCH --error=/tmp/slurm_%j.err
+#SBATCH --partition=normal
+#SBATCH --mem=250G
+#SBATCH --nodes=1 
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --ntasks-per-node=1
+
+# 设置环境变量
+export PIPELINE_ID={pipeline_id}
+export STEP_NAME={step_name}
+export WORKER_ID={self.worker_id}
+export CORE_SERVER_URL={self.core_server_url}
+
+# 执行处理脚本
+conda activate HumanDatabaseTools
+python3 {script_path} --image-path "{image_path}"
+"""
+    
+    async def _check_job_status(self, job_info: JobInfo) -> str:
+        """检查作业状态"""
+        try:
+            cmd = ["squeue", "-j", job_info.job_id, "-h", "-o", "%T"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                status = result.stdout.strip()
+                return status
+            else:
+                # 作业不在队列中，检查是否已完成
+                cmd = ["sacct", "-j", job_info.job_id, "-n", "-o", "State"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    status = result.stdout.strip().split()[0]
+                    return status
+                else:
+                    return "UNKNOWN"
+                    
+        except subprocess.TimeoutExpired:
+            logger.warning(f"检查作业状态超时: {job_info.job_id}")
+            return "TIMEOUT"
+        except Exception as e:
+            logger.error(f"检查作业状态时发生错误: {e}")
+            return "ERROR"
+    
+    async def _monitor_jobs(self):
+        """监控所有运行中的作业"""
+        while self.is_running:
+            try:
+                jobs_to_remove = []
+                
+                for job_key, job_info in self.running_jobs.items():
+                    # 检查作业状态
+                    current_status = await self._check_job_status(job_info)
+                    
+                    if current_status != job_info.status:
+                        logger.info(f"作业状态变化: {job_info.job_id} {job_info.status} -> {current_status}")
+                        job_info.status = current_status
+                        
+                        # 更新进度
+                        await self._update_job_progress(job_info, current_status)
+                    
+                    # 处理已完成或失败的作业
+                    final_states = ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"]
+                    if current_status in final_states:
+                        await self._handle_job_completion(job_info, current_status)
+                        jobs_to_remove.append(job_key)
+                    
+                    job_info.last_check_time = datetime.now()
+                
+                # 移除已完成的作业
+                for job_key in jobs_to_remove:
+                    del self.running_jobs[job_key]
+                
+                await asyncio.sleep(self.job_check_interval)
+                
+            except Exception as e:
+                logger.error(f"监控作业时发生错误: {e}")
+                await asyncio.sleep(self.job_check_interval)
+    
+    async def _update_job_progress(self, job_info: JobInfo, status: str):
+        """更新作业进度"""
+        try:
+            # 映射 SLURM 状态到步骤状态
+            step_status = map_slurm_status_to_step_status(status)
+            
+            # 根据状态设置进度
+            progress = 0
+            if step_status == StepStatusEnum.RUNNING.value:
+                progress = 50  # 可以根据实际情况调整
+            elif step_status == StepStatusEnum.COMPLETED.value:
+                progress = 100
+            elif step_status == StepStatusEnum.FAILED.value:
+                # 如果之前在运行，保持进度；否则设为0
+                progress = 50 if job_info.status == "RUNNING" else 0
+            
+            update_data = {
+                "status": step_status,
+                "progress": progress
+            }
+            
+            url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}"
+            response = await self.http_client.put(url, json=update_data)
+            
+            if response.status_code == 200:
+                logger.debug(f"进度更新成功: {job_info.job_id}")
+            else:
+                logger.warning(f"进度更新失败: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            logger.error(f"更新作业进度时发生错误: {e}")
+    
+    async def _handle_job_completion(self, job_info: JobInfo, final_status: str):
+        """处理作业完成"""
+        try:
+            if final_status == "COMPLETED":
+                # 调用完成API
+                url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
+                complete_data = {
+                    "job_id": job_info.job_id,
+                    "completion_time": datetime.now().isoformat()
+                }
+                response = await self.http_client.post(url, json=complete_data)
+                
+                if response.status_code == 200:
+                    logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
+                else:
+                    logger.warning(f"步骤完成通知发送失败: {response.status_code}")
+            else:
+                # 构建详细的错误信息
+                error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}"
+                
+                # 尝试获取更详细的错误信息
+                try:
+                    error_details = await self._get_job_error_details(job_info.job_id)
+                    if error_details:
+                        error_message += f", 错误详情: {error_details}"
+                except Exception as e:
+                    logger.debug(f"获取作业错误详情失败: {e}")
+                
+                # 调用失败API
+                await self._notify_step_failed(
+                    job_info.pipeline_id, 
+                    job_info.step_name, 
+                    error_message
+                )
+                
+        except Exception as e:
+            logger.error(f"处理作业完成时发生错误: {e}")
+    
+    async def _notify_step_started(self, pipeline_id: str, step_name: str, job_id: str):
+        """通知步骤已开始"""
+        try:
+            url = f"{self.core_server_url}/api/pipeline/{pipeline_id}/step/{step_name}"
+            update_data = {
+                "status": StepStatusEnum.RUNNING.value,
+                "start_time": datetime.now().isoformat(),
+                "progress": 0,
+                "job_id": job_id
+            }
+            
+            response = await self.http_client.put(url, json=update_data)
+            
+            if response.status_code == 200:
+                logger.info(f"步骤开始通知发送成功: {pipeline_id}/{step_name}")
+            else:
+                logger.warning(f"步骤开始通知发送失败: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"通知步骤开始时发生错误: {e}")
+    
+    async def _notify_step_failed(self, pipeline_id: str, step_name: str, error_message: str):
+        """通知步骤失败"""
+        try:
+            url = f"{self.core_server_url}/api/pipeline/{pipeline_id}/step/{step_name}/fail"
+            error_data = {
+                "error_message": error_message,
+                "failure_time": datetime.now().isoformat()
+            }
+            
+            # 根据 core_server_api 的要求，将 error_data 作为请求体发送
+            response = await self.http_client.post(url, json=error_data)
+            
+            if response.status_code == 200:
+                logger.info(f"步骤失败通知发送成功: {pipeline_id}/{step_name}")
+                logger.info(f"失败信息: {error_message}")
+            else:
+                logger.warning(f"步骤失败通知发送失败: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            logger.error(f"通知步骤失败时发生错误: {e}")
+            # 确保即使通知失败，也要记录原始错误信息
+            logger.error(f"原始失败信息: {error_message}")
+    
+    async def _get_job_error_details(self, job_id: str) -> Optional[str]:
+        """获取作业的详细错误信息"""
+        try:
+            # 尝试从 SLURM 获取作业的详细信息
+            cmd = ["sacct", "-j", job_id, "-l", "-n"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                # 解析输出中的错误信息
+                lines = result.stdout.strip().split('\n')
+                if lines:
+                    # 通常第一行包含主要的作业信息
+                    job_info_line = lines[0]
+                    # 这里可以根据需要解析更多信息
+                    return f"SLURM作业详情: {job_info_line[:200]}..."  # 限制长度
+            
+            # 如果 sacct 没有返回有用信息，尝试查看错误日志
+            error_log_path = f"/tmp/slurm_{job_id}.err"
+            if os.path.exists(error_log_path):
+                with open(error_log_path, 'r') as f:
+                    error_content = f.read()
+                    if error_content.strip():
+                        # 返回错误日志的前几行
+                        error_lines = error_content.strip().split('\n')
+                        return ' '.join(error_lines[:3])  # 取前3行
+            
+            return None
+            
+        except subprocess.TimeoutExpired:
+            logger.debug(f"获取作业 {job_id} 错误详情超时")
+            return None
+        except Exception as e:
+            logger.debug(f"获取作业 {job_id} 错误详情时发生异常: {e}")
+            return None
+    
+    async def _send_heartbeat(self):
+        """发送心跳"""
+        while self.is_running:
+            try:
+                heartbeat_data = {
+                    "worker_id": self.worker_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "running_jobs": len(self.running_jobs),
+                    "status": "alive"
+                }
+                
+                # 这里需要根据实际的心跳API端点调整
+                url = f"{self.core_server_url}/api/worker/heartbeat"
+                response = await self.http_client.post(url, json=heartbeat_data)
+                
+                if response.status_code == 200:
+                    logger.debug(f"心跳发送成功")
+                else:
+                    logger.warning(f"心跳发送失败: {response.status_code}")
+                    
+            except Exception as e:
+                logger.error(f"发送心跳时发生错误: {e}")
+            
+            await asyncio.sleep(self.heartbeat_interval)
+    
+    async def get_worker_status(self) -> dict:
+        """获取 worker 状态"""
+        return {
+            "worker_id": self.worker_id,
+            "is_running": self.is_running,
+            "running_jobs_count": len(self.running_jobs),
+            "running_jobs": [
+                {
+                    "job_id": job.job_id,
+                    "pipeline_id": job.pipeline_id,
+                    "step_name": job.step_name,
+                    "status": job.status,
+                    "submit_time": job.submit_time.isoformat(),
+                    "last_check_time": job.last_check_time.isoformat()
+                }
+                for job in self.running_jobs.values()
+            ],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def shutdown(self):
+        """关闭 worker"""
+        logger.info("开始关闭 Pipeline Worker...")
+        self.is_running = False
+        await self.http_client.aclose()
+        logger.info("Pipeline Worker 已关闭")
+
+# FastAPI 应用
+app = FastAPI(title="Pipeline Worker", version="1.0.0")
+
+# 全局 worker 实例
+worker = None
+# 全局文件监控器实例
+file_observer = None
+
+@app.on_event("startup")
+async def startup_event():
+    """启动事件"""
+    global worker, file_observer
+    
+    # 从环境变量或配置读取参数
+    core_server_url = os.getenv("CORE_SERVER_URL", "http://localhost:8000")
+    worker_id = os.getenv("WORKER_ID", f"worker_{os.getpid()}")
+    convert_temp_path = os.getenv("CONVERT_TEMP_PATH")
+    archive_prepare_path = os.getenv("ARCHIVE_PREPARE_PATH") 
+    hndb_archive_path = os.getenv("HNDB_ARCHIVE_PATH")
+    
+    worker = PipelineWorker(
+        core_server_url=core_server_url,
+        worker_id=worker_id,
+        convert_temp_path=convert_temp_path,
+        archive_prepare_path=archive_prepare_path,
+        hndb_archive_path=hndb_archive_path
+    )
+    
+    # 启动后台任务
+    asyncio.create_task(worker._monitor_jobs())
+    asyncio.create_task(worker._send_heartbeat())
+    
+    # 启动文件监控器
+    file_observer = UploadFileWatcher()
+    
+    logger.info("Pipeline Worker 启动完成")
+
+
+def UploadFileWatcher():
+    """
+    监听cfg.ImageRootDirectory路径下的.h5文件上传
+    当检测到新的.h5文件时，触发相应的处理逻辑
+    """
+    
+    class H5FileHandler(FileSystemEventHandler):
+        """H5文件事件处理器"""
+        
+        def __init__(self):
+            super().__init__()
+            self.logger = logging.getLogger(f"{__name__}.H5FileHandler")
+        
+        def on_created(self, event):
+            """当文件被创建时触发"""
+            if os.path.isdir(event.src_path):
+                return
+
+            file_path = event.src_path
+            if file_path.endswith('.h5'):
+                self.logger.info(f"检测到新的H5文件: {file_path}")
+                self._handle_h5_file(file_path)
+        
+        def on_moved(self, event):
+            """当文件被移动时触发（可能是上传完成后的重命名）"""
+            if event.is_dir:
+                return
+            
+            dest_path = event.dest_path
+            if dest_path.endswith('.h5'):
+                self.logger.info(f"检测到H5文件移动: {event.src_path} -> {dest_path}")
+                self._handle_h5_file(dest_path)
+        
+        def _handle_h5_file(self, file_path: str):
+            """处理检测到的H5文件"""
+            try:
+                global worker
+
+                # 获取文件名（不包含路径）
+                file_name = os.path.basename(file_path)
+                self.logger.info(f"处理H5文件: {file_name}")
+                
+                # 等待文件上传完成（检查文件大小是否稳定）
+                if self._wait_for_file_stable(file_path):
+                    self.logger.info(f"H5文件上传完成: {file_name}")
+                
+                create_data = {
+                    "h5_img_name": f"H5ImgName_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    "uploader": "示例用户",
+                    "notification_emails": [],  # 请替换为您的邮箱
+                    "wait_for_image_upload": False
+                }
+                
+                url = f"{worker.core_server_url}/api/pipeline/create"
+                try:
+                    response = worker.http_client.post(url, json=create_data)
+                    # wait for the response
+                    response = asyncio.run(response)
+                    if response.status_code == 200:
+                        pipeline_data = response.json()
+                        pipeline_id = pipeline_data["pipeline_id"]
+                        print(f"✅ 流程创建成功！流程ID: {pipeline_id}")
+                    else:
+                        print(f"❌ 流程创建失败: {response.text}")
+                except Exception as e:
+                    self.logger.error(f"发送新文件通知时发生错误: {e}")
+                            
+            except Exception as e:
+                self.logger.error(f"处理H5文件时发生错误: {e}")
+        
+        def _wait_for_file_stable(self, file_path: str, max_wait_time: int = 30) -> bool:
+            """等待文件大小稳定，确认上传完成"""
+            try:
+                if not os.path.exists(file_path):
+                    return False
+                
+                prev_size = -1
+                stable_count = 0
+                wait_time = 0
+                
+                while wait_time < max_wait_time:
+                    try:
+                        current_size = os.path.getsize(file_path)
+                        
+                        if current_size == prev_size and current_size > 0:
+                            stable_count += 1
+                            if stable_count >= 3:  # 连续3次大小相同认为稳定
+                                return True
+                        else:
+                            stable_count = 0
+                        
+                        prev_size = current_size
+                        time.sleep(1)
+                        wait_time += 1
+                        
+                    except OSError:
+                        # 文件可能还在写入中
+                        time.sleep(1)
+                        wait_time += 1
+                        continue
+                
+                return False
+                
+            except Exception as e:
+                self.logger.error(f"检查文件稳定性时发生错误: {e}")
+                return False
+        
+        async def _notify_new_file(self, file_name: str, file_path: str):
+            """通知有新文件上传"""
+            try:
+                # 如果worker实例存在，可以通过它来通知core server
+                global worker
+                if worker:
+                    # 构造通知数据
+                    notification_data = {
+                        "event_type": "new_h5_file",
+                        "file_name": file_name,
+                        "file_path": file_path,
+                        "file_size": os.path.getsize(file_path),
+                        "timestamp": datetime.now().isoformat(),
+                        "worker_id": worker.worker_id
+                    }
+                    
+                    # 发送通知到core server
+                    url = f"{worker.core_server_url}/api/files/notification"
+                    try:
+                        response = await worker.http_client.post(url, json=notification_data)
+                        if response.status_code == 200:
+                            self.logger.info(f"新文件通知发送成功: {file_name}")
+                        else:
+                            self.logger.warning(f"新文件通知发送失败: {response.status_code}")
+                    except Exception as e:
+                        self.logger.error(f"发送新文件通知时发生错误: {e}")
+                        
+            except Exception as e:
+                self.logger.error(f"通知新文件时发生错误: {e}")
+    
+    # 创建文件监控
+    watch_path = cfg.ImageRootDirectory
+    
+    if not os.path.exists(watch_path):
+        logger.warning(f"监控路径不存在: {watch_path}")
+        return None
+    
+    event_handler = H5FileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, watch_path, recursive=True)
+    
+    logger.info(f"开始监控H5文件上传，监控路径: {watch_path}")
+    observer.start()
+    
+    return observer
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """关闭事件"""
+    global worker, file_observer
+    
+    # 停止文件监控器
+    if file_observer:
+        file_observer.stop()
+        file_observer.join()
+        logger.info("文件监控器已停止")
+    
+    # 关闭worker
+    if worker:
+        await worker.shutdown()
+
+@app.post("/api/worker/start")
+async def start_step_endpoint(
+    request: StartStepRequest
+):
+    print(f"接收到开始步骤请求: {request.pipeline_id}/{request.step_name} - {request.h5_image_name}")
+    """接收步骤开始请求"""
+    if not worker:
+        raise HTTPException(status_code=500, detail="Worker 未初始化")
+    
+    # 同步处理步骤开始，以便返回准确的状态
+    result = await worker.start_step(request.pipeline_id, request.step_name, request.h5_image_name)
+    
+    # 根据返回结果构造响应
+    if result["status"] == "already_running":
+        return {
+            "message": f"步骤 {request.step_name} 已在运行中",
+            "pipeline_id": request.pipeline_id,
+            "status": "already_running",
+            "job_id": result.get("job_id")
+        }
+    elif result["status"] == "submitted":
+        return {
+            "message": f"步骤 {request.step_name} 开始请求已提交",
+            "pipeline_id": request.pipeline_id,
+            "status": "submitted",
+            "job_id": result.get("job_id")
+        }
+    elif result["status"] == "failed":
+        raise HTTPException(
+            status_code=500, 
+            detail=f"步骤提交失败: {result.get('error', '未知错误')}"
+        )
+    else:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"步骤处理出错: {result.get('error', '未知错误')}"
+        )
+
+@app.get("/api/worker/status")
+async def get_worker_status():
+    """获取 worker 状态"""
+    if not worker:
+        raise HTTPException(status_code=500, detail="Worker 未初始化")
+    
+    return await worker.get_worker_status()
+
+@app.get("/api/worker/file-watcher/status")
+async def get_file_watcher_status():
+    """获取文件监控器状态"""
+    global file_observer
+    
+    if not file_observer:
+        return {
+            "status": "not_running",
+            "watch_path": cfg.ImageRootDirectory,
+            "message": "文件监控器未启动"
+        }
+    
+    return {
+        "status": "running" if file_observer.is_alive() else "stopped",
+        "watch_path": cfg.ImageRootDirectory,
+        "is_alive": file_observer.is_alive(),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/api/worker/health")
+async def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "worker_id": worker.worker_id if worker else "unknown",
+        "timestamp": datetime.now().isoformat()
+    }
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Pipeline Worker")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
+    parser.add_argument("--core-server-url", default="http://localhost:8000", help="Core Server URL")
+    parser.add_argument("--worker-id", help="Worker ID")
+    parser.add_argument("--convert-temp-path", help="Convert temporary files path")
+    parser.add_argument("--archive-prepare-path", help="Archive preparation path")
+    parser.add_argument("--hndb-archive-path", help="HNDB archive path")
+    
+    args = parser.parse_args()
+    
+    # 设置环境变量
+    os.environ["CORE_SERVER_URL"] = args.core_server_url
+    if args.worker_id:
+        os.environ["WORKER_ID"] = args.worker_id
+    if args.convert_temp_path:
+        os.environ["CONVERT_TEMP_PATH"] = args.convert_temp_path
+    if args.archive_prepare_path:
+        os.environ["ARCHIVE_PREPARE_PATH"] = args.archive_prepare_path
+    if args.hndb_archive_path:
+        os.environ["HNDB_ARCHIVE_PATH"] = args.hndb_archive_path
+    
+    uvicorn.run(app, host=args.host, port=args.port)
