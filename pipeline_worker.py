@@ -28,6 +28,7 @@ import uvicorn
 import config as cfg
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import archive
 
 # 配置日志
 logging.basicConfig(
@@ -79,6 +80,7 @@ class JobInfo:
     step_name: str
     submit_time: datetime
     last_check_time: datetime
+    h5_image_name: Optional[str] = None
     status: str = "PENDING"
 
 class PipelineWorker:
@@ -109,6 +111,9 @@ class PipelineWorker:
         # 工作状态
         self.is_running = True
         
+        # 后台任务
+        self.background_tasks: List[asyncio.Task] = []
+        
         logger.info(f"Pipeline Worker 初始化完成，Worker ID: {self.worker_id}")
 
     async def start_step(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> dict:
@@ -132,7 +137,8 @@ class PipelineWorker:
                     pipeline_id=pipeline_id,
                     step_name=step_name,
                     submit_time=datetime.now(),
-                    last_check_time=datetime.now()
+                    last_check_time=datetime.now(),
+                    h5_image_name=h5_image_name
                 )
                 self.running_jobs[job_key] = job_info
                 
@@ -153,7 +159,7 @@ class PipelineWorker:
             await self._notify_step_failed(pipeline_id, step_name, str(e))
             return {"status": "error", "error": str(e)}
     
-    async def _submit_sbatch_job(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> Optional[str]:
+    async def _submit_sbatch_job(self, pipeline_id: str, step_name: str, h5_image_name: str) -> Optional[str]:
         """提交 sbatch 作业"""
         try:
             # 根据步骤名称选择对应的处理脚本
@@ -174,8 +180,16 @@ class PipelineWorker:
             if not os.path.exists(script_path):
                 raise FileNotFoundError(f"处理脚本不存在: {script_path}")
             
+            image_name = h5_image_name if h5_image_name is not None else ""
+            if step_name == "h5_to_v3draw" or step_name == "mip_generation":
+                image_name = h5_image_name if h5_image_name is not None else ""
+            elif step_name == "bit_conversion" and image_name:
+                image_name = image_name.replace('.pyramid.h5', '.v3draw')
+            elif step_name == "downsample" and image_name:
+                image_name = image_name.replace('.pyramid.h5', '_8bit.v3draw')
+
             # 构建 sbatch 命令
-            sbatch_script = self._generate_sbatch_script(pipeline_id, step_name, script_path, h5_image_name)
+            sbatch_script = self._generate_sbatch_script(pipeline_id, step_name, script_path, image_name)
             
             # 写入临时脚本文件
             temp_script_path = f"/tmp/sbatch_{pipeline_id}_{step_name}_{int(time.time())}.sh"
@@ -203,17 +217,17 @@ class PipelineWorker:
             logger.error(f"提交 sbatch 作业时发生错误: {e}")
             return None
     
-    def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, h5_image_name: Optional[str] = None) -> str:
+    def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, image_name: str) -> str:
         """生成 sbatch 脚本内容"""
-        image_path = os.path.join(cfg.ImageRootDirectory, h5_image_name if h5_image_name else "") 
+        image_path = os.path.join(cfg.ImageRootDirectory, image_name if image_name else "") 
 
         return f"""#!/bin/bash
 #SBATCH --job-name={step_name}_{pipeline_id}
 #SBATCH --output=/tmp/slurm_%j.out
 #SBATCH --error=/tmp/slurm_%j.err
-#SBATCH --partition=normal
-#SBATCH --mem=250G
-#SBATCH --nodes=1 
+#SBATCH --partition=CPU
+#SBATCH --mem=50G
+#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --ntasks-per-node=1
@@ -225,6 +239,7 @@ export WORKER_ID={self.worker_id}
 export CORE_SERVER_URL={self.core_server_url}
 
 # 执行处理脚本
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate HumanDatabaseTools
 python3 {script_path} --image-path "{image_path}"
 """
@@ -260,6 +275,11 @@ python3 {script_path} --image-path "{image_path}"
         """监控所有运行中的作业"""
         while self.is_running:
             try:
+                # 检查 http_client 是否可用
+                if self.http_client.is_closed:
+                    logger.debug("HTTP 客户端已关闭，停止作业监控")
+                    break
+                    
                 jobs_to_remove = []
                 
                 for job_key, job_info in self.running_jobs.items():
@@ -289,11 +309,20 @@ python3 {script_path} --image-path "{image_path}"
                 
             except Exception as e:
                 logger.error(f"监控作业时发生错误: {e}")
+                # 如果是因为事件循环关闭导致的错误，停止监控
+                if "Event loop is closed" in str(e):
+                    logger.debug("检测到事件循环已关闭，停止作业监控")
+                    break
                 await asyncio.sleep(self.job_check_interval)
     
     async def _update_job_progress(self, job_info: JobInfo, status: str):
         """更新作业进度"""
         try:
+            # 检查 worker 是否仍在运行且 http_client 可用
+            if not self.is_running or self.http_client.is_closed:
+                logger.debug(f"跳过进度更新，worker 已关闭或 http_client 不可用: {job_info.job_id}")
+                return
+                
             # 映射 SLURM 状态到步骤状态
             step_status = map_slurm_status_to_step_status(status)
             
@@ -322,23 +351,66 @@ python3 {script_path} --image-path "{image_path}"
                 
         except Exception as e:
             logger.error(f"更新作业进度时发生错误: {e}")
+            # 如果是因为事件循环关闭导致的错误，不再尝试重新连接
+            if "Event loop is closed" in str(e):
+                logger.debug("检测到事件循环已关闭，停止进度更新")
+                return
     
     async def _handle_job_completion(self, job_info: JobInfo, final_status: str):
         """处理作业完成"""
         try:
-            if final_status == "COMPLETED":
-                # 调用完成API
-                url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
-                complete_data = {
-                    "job_id": job_info.job_id,
-                    "completion_time": datetime.now().isoformat()
-                }
-                response = await self.http_client.post(url, json=complete_data)
+            # 检查 worker 是否仍在运行且 http_client 可用
+            if not self.is_running or self.http_client.is_closed:
+                logger.debug(f"跳过作业完成处理，worker 已关闭或 http_client 不可用: {job_info.job_id}")
+                return
                 
-                if response.status_code == 200:
-                    logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
+            if final_status == "COMPLETED":
+                # 根据步骤名称组成对应的文件名
+                h5_image_name = job_info.h5_image_name if job_info.h5_image_name is not None else ""
+                script_mapping = {
+                    "mip_generation": f"{h5_image_name.replace('.pyramid.h5', '_MIP.tif')}",
+                    "h5_to_v3draw": f"{h5_image_name.replace('.pyramid.h5', '.v3draw')}",
+                    "bit_conversion": f"{h5_image_name.replace('.pyramid.h5', '_8bit.v3draw')}",
+                    "downsample": f"{h5_image_name.replace('.pyramid.h5', '_8bit_downsampled.v3draw')}",
+                }
+
+                if not os.path.exists(os.path.join(cfg.ImageTransferTemp, script_mapping.get(job_info.step_name, h5_image_name))):
+                    # 构建详细的错误信息
+                    error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}, 任务结束但未找到处理后的结果文件！"
+                    
+                    # 尝试获取更详细的错误信息
+                    try:
+                        error_details = await self._get_job_error_details(job_info.job_id)
+                        if error_details:
+                            error_message += f", 错误详情: {error_details}"
+                    except Exception as e:
+                        logger.debug(f"获取作业错误详情失败: {e}")
+                    
+                    # 调用失败API
+                    await self._notify_step_failed(
+                        job_info.pipeline_id, 
+                        job_info.step_name, 
+                        error_message
+                    )
                 else:
-                    logger.warning(f"步骤完成通知发送失败: {response.status_code}")
+                    # Archive files sequentially - ensure organize_image_files completes before ArchiveCommand
+                    # Using await asyncio.to_thread to run blocking functions without blocking the event loop
+                    await asyncio.to_thread(archive.organize_image_files)
+                    # Only execute ArchiveCommand after organize_image_files is complete
+                    await asyncio.to_thread(archive.ArchiveCommand)
+
+                    # 调用完成API
+                    url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
+                    complete_data = {
+                        "job_id": job_info.job_id,
+                        "completion_time": datetime.now().isoformat()
+                    }
+                    response = await self.http_client.post(url, json=complete_data)
+                    
+                    if response.status_code == 200:
+                        logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
+                    else:
+                        logger.warning(f"步骤完成通知发送失败: {response.status_code}")
             else:
                 # 构建详细的错误信息
                 error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}"
@@ -364,6 +436,11 @@ python3 {script_path} --image-path "{image_path}"
     async def _notify_step_started(self, pipeline_id: str, step_name: str, job_id: str):
         """通知步骤已开始"""
         try:
+            # 检查 worker 是否仍在运行且 http_client 可用
+            if not self.is_running or self.http_client.is_closed:
+                logger.debug(f"跳过步骤开始通知，worker 已关闭或 http_client 不可用: {pipeline_id}/{step_name}")
+                return
+                
             url = f"{self.core_server_url}/api/pipeline/{pipeline_id}/step/{step_name}"
             update_data = {
                 "status": StepStatusEnum.RUNNING.value,
@@ -381,10 +458,20 @@ python3 {script_path} --image-path "{image_path}"
                 
         except Exception as e:
             logger.error(f"通知步骤开始时发生错误: {e}")
+            # 如果是因为事件循环关闭导致的错误，不再尝试重新连接
+            if "Event loop is closed" in str(e):
+                logger.debug("检测到事件循环已关闭，停止步骤开始通知")
+                return
     
     async def _notify_step_failed(self, pipeline_id: str, step_name: str, error_message: str):
         """通知步骤失败"""
         try:
+            # 检查 worker 是否仍在运行且 http_client 可用
+            if not self.is_running or self.http_client.is_closed:
+                logger.debug(f"跳过步骤失败通知，worker 已关闭或 http_client 不可用: {pipeline_id}/{step_name}")
+                logger.error(f"原始失败信息: {error_message}")
+                return
+                
             url = f"{self.core_server_url}/api/pipeline/{pipeline_id}/step/{step_name}/fail"
             error_data = {
                 "error_message": error_message,
@@ -404,6 +491,10 @@ python3 {script_path} --image-path "{image_path}"
             logger.error(f"通知步骤失败时发生错误: {e}")
             # 确保即使通知失败，也要记录原始错误信息
             logger.error(f"原始失败信息: {error_message}")
+            # 如果是因为事件循环关闭导致的错误，不再尝试重新连接
+            if "Event loop is closed" in str(e):
+                logger.debug("检测到事件循环已关闭，停止步骤失败通知")
+                return
     
     async def _get_job_error_details(self, job_id: str) -> Optional[str]:
         """获取作业的详细错误信息"""
@@ -444,6 +535,11 @@ python3 {script_path} --image-path "{image_path}"
         """发送心跳"""
         while self.is_running:
             try:
+                # 检查 worker 是否仍在运行且 http_client 可用
+                if not self.is_running or self.http_client.is_closed:
+                    logger.debug("跳过心跳发送，worker 已关闭或 http_client 不可用")
+                    break
+                    
                 heartbeat_data = {
                     "worker_id": self.worker_id,
                     "timestamp": datetime.now().isoformat(),
@@ -462,6 +558,10 @@ python3 {script_path} --image-path "{image_path}"
                     
             except Exception as e:
                 logger.error(f"发送心跳时发生错误: {e}")
+                # 如果是因为事件循环关闭导致的错误，停止心跳
+                if "Event loop is closed" in str(e):
+                    logger.debug("检测到事件循环已关闭，停止心跳发送")
+                    break
             
             await asyncio.sleep(self.heartbeat_interval)
     
@@ -478,7 +578,8 @@ python3 {script_path} --image-path "{image_path}"
                     "step_name": job.step_name,
                     "status": job.status,
                     "submit_time": job.submit_time.isoformat(),
-                    "last_check_time": job.last_check_time.isoformat()
+                    "last_check_time": job.last_check_time.isoformat(),
+                    "h5_image_name": job.h5_image_name
                 }
                 for job in self.running_jobs.values()
             ],
@@ -488,8 +589,30 @@ python3 {script_path} --image-path "{image_path}"
     async def shutdown(self):
         """关闭 worker"""
         logger.info("开始关闭 Pipeline Worker...")
+        
+        # 停止后台任务
         self.is_running = False
-        await self.http_client.aclose()
+        
+        # 等待后台任务完成
+        if self.background_tasks:
+            logger.info("等待后台任务完成...")
+            # 给后台任务一些时间来检查 is_running 状态
+            await asyncio.sleep(1)
+            
+            # 取消所有后台任务
+            for task in self.background_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # 等待所有任务完成或被取消
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+            logger.info("后台任务已停止")
+        
+        # 关闭 HTTP 客户端
+        if not self.http_client.is_closed:
+            await self.http_client.aclose()
+            logger.info("HTTP 客户端已关闭")
+        
         logger.info("Pipeline Worker 已关闭")
 
 # FastAPI 应用
@@ -520,9 +643,12 @@ async def startup_event():
         hndb_archive_path=hndb_archive_path
     )
     
-    # 启动后台任务
-    asyncio.create_task(worker._monitor_jobs())
-    asyncio.create_task(worker._send_heartbeat())
+    # 启动后台任务并保存任务引用
+    monitor_task = asyncio.create_task(worker._monitor_jobs())
+    heartbeat_task = asyncio.create_task(worker._send_heartbeat())
+    
+    # 保存任务引用以便稍后管理
+    worker.background_tasks = [monitor_task, heartbeat_task]
     
     # 启动文件监控器
     file_observer = UploadFileWatcher()
@@ -555,7 +681,7 @@ def UploadFileWatcher():
         
         def on_moved(self, event):
             """当文件被移动时触发（可能是上传完成后的重命名）"""
-            if event.is_dir:
+            if os.path.isdir(event.src_path):
                 return
             
             dest_path = event.dest_path
@@ -576,26 +702,65 @@ def UploadFileWatcher():
                 if self._wait_for_file_stable(file_path):
                     self.logger.info(f"H5文件上传完成: {file_name}")
                 
-                create_data = {
-                    "h5_img_name": f"H5ImgName_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                    "uploader": "示例用户",
-                    "notification_emails": [],  # 请替换为您的邮箱
-                    "wait_for_image_upload": False
-                }
+                # 检查 worker 是否可用
+                if worker is None:
+                    self.logger.error("Worker 实例不可用，无法创建流程")
+                    return
                 
-                url = f"{worker.core_server_url}/api/pipeline/create"
-                try:
-                    response = worker.http_client.post(url, json=create_data)
-                    # wait for the response
-                    response = asyncio.run(response)
-                    if response.status_code == 200:
-                        pipeline_data = response.json()
-                        pipeline_id = pipeline_data["pipeline_id"]
-                        print(f"✅ 流程创建成功！流程ID: {pipeline_id}")
-                    else:
-                        print(f"❌ 流程创建失败: {response.text}")
-                except Exception as e:
-                    self.logger.error(f"发送新文件通知时发生错误: {e}")
+                if worker.http_client.is_closed or not worker.is_running:
+                    self.logger.error("Worker 已关闭或HTTP 客户端不可用，无法创建流程")
+                    return
+                
+                # 保存core_server_url以避免在线程中访问worker实例
+                core_server_url = worker.core_server_url
+                
+                # 使用线程池来处理异步任务，避免事件循环冲突
+                import threading
+                
+                def create_pipeline_async():
+                    """在新线程中创建流程"""
+                    loop = None
+                    try:
+                        # 创建新的事件循环
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        create_data = {
+                            "h5_img_name": f"{file_name}",
+                            "uploader": "示例用户",
+                            "notification_emails": [],  # 请替换为您的邮箱
+                            "wait_for_image_upload": False
+                        }
+                        
+                        url = f"{core_server_url}/api/pipeline/create"
+                        
+                        # 创建新的HTTP客户端用于此请求
+                        async def make_request():
+                            async with httpx.AsyncClient(timeout=30.0) as client:
+                                response = await client.post(url, json=create_data)
+                                if response.status_code == 200:
+                                    pipeline_data = response.json()
+                                    pipeline_id = pipeline_data["pipeline_id"]
+                                    self.logger.info(f"✅ 流程创建成功！流程ID: {pipeline_id}")
+                                else:
+                                    self.logger.error(f"❌ 流程创建失败: {response.text}")
+                        
+                        # 运行异步请求
+                        loop.run_until_complete(make_request())
+                        
+                    except Exception as e:
+                        self.logger.error(f"创建流程时发生错误: {e}")
+                    finally:
+                        if loop is not None:
+                            try:
+                                loop.close()
+                            except Exception:
+                                pass
+                
+                # 在新线程中运行异步操作
+                thread = threading.Thread(target=create_pipeline_async)
+                thread.daemon = True
+                thread.start()
                             
             except Exception as e:
                 self.logger.error(f"处理H5文件时发生错误: {e}")
@@ -642,7 +807,7 @@ def UploadFileWatcher():
             try:
                 # 如果worker实例存在，可以通过它来通知core server
                 global worker
-                if worker:
+                if worker and not worker.http_client.is_closed:
                     # 构造通知数据
                     notification_data = {
                         "event_type": "new_h5_file",
@@ -663,6 +828,11 @@ def UploadFileWatcher():
                             self.logger.warning(f"新文件通知发送失败: {response.status_code}")
                     except Exception as e:
                         self.logger.error(f"发送新文件通知时发生错误: {e}")
+                        # 如果是因为事件循环关闭导致的错误，记录但不重试
+                        if "Event loop is closed" in str(e):
+                            self.logger.debug("检测到事件循环已关闭，停止新文件通知")
+                else:
+                    self.logger.debug("Worker 实例不可用或 HTTP 客户端已关闭，跳过新文件通知")
                         
             except Exception as e:
                 self.logger.error(f"通知新文件时发生错误: {e}")
