@@ -338,7 +338,8 @@ python3 {script_path} --image-path "{image_path}"
             
             update_data = {
                 "status": step_status,
-                "progress": progress
+                "progress": progress,
+                "error_message": ""
             }
             
             url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}"
@@ -374,43 +375,47 @@ python3 {script_path} --image-path "{image_path}"
                     "downsample": f"{h5_image_name.replace('.pyramid.h5', '_8bit_downsampled.v3draw')}",
                 }
 
-                if not os.path.exists(os.path.join(cfg.ImageTransferTemp, script_mapping.get(job_info.step_name, h5_image_name))):
-                    # 构建详细的错误信息
-                    error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}, 任务结束但未找到处理后的结果文件！"
-                    
-                    # 尝试获取更详细的错误信息
-                    try:
-                        error_details = await self._get_job_error_details(job_info.job_id)
-                        if error_details:
-                            error_message += f", 错误详情: {error_details}"
-                    except Exception as e:
-                        logger.debug(f"获取作业错误详情失败: {e}")
-                    
-                    # 调用失败API
-                    await self._notify_step_failed(
-                        job_info.pipeline_id, 
-                        job_info.step_name, 
-                        error_message
-                    )
-                else:
-                    # Archive files sequentially - ensure organize_image_files completes before ArchiveCommand
-                    # Using await asyncio.to_thread to run blocking functions without blocking the event loop
-                    await asyncio.to_thread(archive.organize_image_files)
-                    # Only execute ArchiveCommand after organize_image_files is complete
-                    await asyncio.to_thread(archive.ArchiveCommand)
 
-                    # 调用完成API
-                    url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
-                    complete_data = {
-                        "job_id": job_info.job_id,
-                        "completion_time": datetime.now().isoformat()
-                    }
-                    response = await self.http_client.post(url, json=complete_data)
-                    
-                    if response.status_code == 200:
-                        logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
-                    else:
-                        logger.warning(f"步骤完成通知发送失败: {response.status_code}")
+                file_to_check = script_mapping.get(job_info.step_name, "")
+                if file_to_check != "":
+                    if not os.path.exists(os.path.join(cfg.ImageTransferTemp, file_to_check)):
+                        # 构建详细的错误信息
+                        error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}, 任务结束但未找到处理后的结果文件！"
+                        
+                        # 尝试获取更详细的错误信息
+                        try:
+                            error_details = await self._get_job_error_details(job_info.job_id)
+                            if error_details:
+                                error_message += f", 错误详情: {error_details}"
+                        except Exception as e:
+                            logger.debug(f"获取作业错误详情失败: {e}")
+                        
+                        # 调用失败API
+                        await self._notify_step_failed(
+                            job_info.pipeline_id, 
+                            job_info.step_name,
+                            error_message
+                        )
+                        return
+                    elif job_info.step_name == "mip_generation":
+                        # Archive files sequentially - ensure organize_image_files completes before ArchiveCommand
+                        # Using await asyncio.to_thread to run blocking functions without blocking the event loop
+                        await asyncio.to_thread(archive.organize_image_files)
+                        # Only execute ArchiveCommand after organize_image_files is complete
+                        await asyncio.to_thread(archive.ArchiveCommand)
+
+                # 调用完成API
+                url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
+                complete_data = {
+                    "job_id": job_info.job_id,
+                    "completion_time": datetime.now().isoformat()
+                }
+                response = await self.http_client.post(url, json=complete_data)
+                
+                if response.status_code == 200:
+                    logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
+                else:
+                    logger.warning(f"步骤完成通知发送失败: {response.status_code}")
             else:
                 # 构建详细的错误信息
                 error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}"

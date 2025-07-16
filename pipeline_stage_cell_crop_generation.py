@@ -210,4 +210,6 @@ if __name__ == '__main__':
     input_path = args.image_path
     input_path = input_path.strip()
 
-    main(input_path)
+    h5_image_name = os.path.basename(input_path)
+
+    main(h5_image_name)

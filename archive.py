@@ -12,7 +12,7 @@ def organize_image_files():
     os.makedirs(target_base_dir, exist_ok=True)
 
     # 正则表达式匹配图像ID模式: P00134-T001-R001-S012-B1-N1
-    pattern = r'(P\d+-T\d+-R\d+-S\d+(?:-B\d+)?(?:-N\d+)?)'
+    pattern = r'(P\d+-T\d+-R\d+-S\d+(?:-B\d+)?(?:-\d+)?)'
 
     # 获取源目录中的所有文件
     try:
@@ -90,7 +90,7 @@ def ArchiveCommand():
         for dirname in dirnames:
             shutil.move(
                 os.path.join(dirpath, dirname),
-                cfg.ImageArchiveDirectory
+                os.path.join(cfg.PTRSB_DBDirectory, dirname)
             )
 
     print("归档命令执行完成!")
