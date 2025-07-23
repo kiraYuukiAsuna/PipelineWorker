@@ -1,13 +1,13 @@
 import os
 
-CoreServerURL = "http://localhost:8000"
+CoreServerURL = "http://223.3.34.110:8000"
 
 ImageRootDirectory = "/PBshare/cloudForsftp/seusftp/upload"
 ImageTransferTemp = os.path.join(ImageRootDirectory, "transfer_temp")
 ImageProcessedFilesArchive = os.path.join(
     ImageRootDirectory, "Processed_Files_Archive")
 
-HNDBRootDirectory = "/home/seele/Desktop/WorkSpace/PipelineWorker/HNDB"
+HNDBRootDirectory = "/PBshare/BRAINTELL/Projects/HumanNeurons/AllBrainSlices"
 SamplePreparationDirectory = os.path.join(HNDBRootDirectory, "HNDB_files", "SamplePreparation")
 Cell_ImagesDirectory = os.path.join(HNDBRootDirectory, "Cell_Images")
 Cell_MIPsDirectory = os.path.join(HNDBRootDirectory, "Cell_MIPs")
