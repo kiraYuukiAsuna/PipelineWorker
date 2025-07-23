@@ -24,7 +24,7 @@ def test_upload_file_watcher():
         
         # 创建一个模拟的config模块
         with open('test_config.py', 'w') as f:
-            f.write(f'ImageRootDirectory = "{test_dir}"\n')
+            f.write(f'ImageTransferTemp = "{test_dir}"\n')
         
         # 导入并修改配置
         import config as cfg

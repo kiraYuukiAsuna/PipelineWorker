@@ -3,7 +3,7 @@ Pipeline Worker - 图像处理流程工作器
 负责接收任务、提交sbatch作业、监控状态并与hndb api交互
 
 新增功能:
-- UploadFileWatcher: 监控cfg.ImageRootDirectory路径下的.h5文件上传
+- UploadFileWatcher: 监控cfg.ImageTransferTemp路径下的.h5文件上传
   * 实时监控指定目录下的.h5文件变化
   * 检测文件创建和移动事件
   * 等待文件上传完成（通过文件大小稳定性检查）
@@ -213,7 +213,7 @@ class PipelineWorker:
     
     def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, image_name: str) -> str:
         """生成 sbatch 脚本内容"""
-        image_path = os.path.join(cfg.ImageRootDirectory, image_name if image_name else "") 
+        image_path = os.path.join(cfg.ImageTransferTemp, image_name if image_name else "") 
 
         return f"""#!/bin/bash
 #SBATCH --job-name={step_name}_{pipeline_id}
@@ -651,7 +651,7 @@ async def startup_event():
 
 def UploadFileWatcher():
     """
-    监听cfg.ImageRootDirectory路径下的.h5文件上传
+    监听cfg.ImageTransferTemp路径下的.h5文件上传
     当检测到新的.h5文件时，触发相应的处理逻辑
     """
     
@@ -831,7 +831,7 @@ def UploadFileWatcher():
                 self.logger.error(f"通知新文件时发生错误: {e}")
     
     # 创建文件监控
-    watch_path = cfg.ImageRootDirectory
+    watch_path = cfg.ImageTransferTemp
     
     if not os.path.exists(watch_path):
         logger.warning(f"监控路径不存在: {watch_path}")
@@ -916,13 +916,13 @@ async def get_file_watcher_status():
     if not file_observer:
         return {
             "status": "not_running",
-            "watch_path": cfg.ImageRootDirectory,
+            "watch_path": cfg.ImageTransferTemp,
             "message": "文件监控器未启动"
         }
     
     return {
         "status": "running" if file_observer.is_alive() else "stopped",
-        "watch_path": cfg.ImageRootDirectory,
+        "watch_path": cfg.ImageTransferTemp,
         "is_alive": file_observer.is_alive(),
         "timestamp": datetime.now().isoformat()
     }
@@ -941,7 +941,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Pipeline Worker")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
+    parser.add_argument("--port", type=int, default=7000, help="Port to bind to")
     
     args = parser.parse_args()
     

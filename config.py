@@ -1,6 +1,6 @@
 import os
 
-CoreServerURL = "http://223.3.34.110:8000"
+CoreServerURL = "http://172.16.1.125:8000"
 
 ImageRootDirectory = "/PBshare/cloudForsftp/seusftp/upload"
 ImageTransferTemp = os.path.join(ImageRootDirectory, "transfer_temp")
