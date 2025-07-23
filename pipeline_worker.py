@@ -88,17 +88,11 @@ class PipelineWorker:
                  core_server_url: str = "http://localhost:8000",
                  worker_id: Optional[str] = None,
                  heartbeat_interval: int = 30,
-                 job_check_interval: int = 10,
-                 convert_temp_path: Optional[str] = None,
-                 archive_prepare_path: Optional[str] = None,
-                 hndb_archive_path: Optional[str] = None):
+                 job_check_interval: int = 10):
         self.core_server_url = core_server_url.rstrip('/')
         self.worker_id = worker_id or f"worker_{os.getpid()}"
         self.heartbeat_interval = heartbeat_interval
         self.job_check_interval = job_check_interval
-        self.convert_temp_path = convert_temp_path
-        self.archive_prepare_path = archive_prepare_path
-        self.hndb_archive_path = hndb_archive_path
         
         # 存储正在运行的作业
         self.running_jobs: Dict[str, JobInfo] = {}
@@ -506,18 +500,12 @@ async def startup_event():
     global worker, file_observer
     
     # 从环境变量或配置读取参数
-    core_server_url = os.getenv("CORE_SERVER_URL", "http://localhost:8000")
-    worker_id = os.getenv("WORKER_ID", f"worker_{os.getpid()}")
-    convert_temp_path = os.getenv("CONVERT_TEMP_PATH")
-    archive_prepare_path = os.getenv("ARCHIVE_PREPARE_PATH") 
-    hndb_archive_path = os.getenv("HNDB_ARCHIVE_PATH")
+    core_server_url = cfg.CoreServerURL
+    worker_id = f"worker_{os.getpid()}"
     
     worker = PipelineWorker(
         core_server_url=core_server_url,
-        worker_id=worker_id,
-        convert_temp_path=convert_temp_path,
-        archive_prepare_path=archive_prepare_path,
-        hndb_archive_path=hndb_archive_path
+        worker_id=worker_id
     )
     
     # 启动后台任务
@@ -779,23 +767,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pipeline Worker")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8001, help="Port to bind to")
-    parser.add_argument("--core-server-url", default="http://localhost:8000", help="Core Server URL")
-    parser.add_argument("--worker-id", help="Worker ID")
-    parser.add_argument("--convert-temp-path", help="Convert temporary files path")
-    parser.add_argument("--archive-prepare-path", help="Archive preparation path")
-    parser.add_argument("--hndb-archive-path", help="HNDB archive path")
     
     args = parser.parse_args()
-    
-    # 设置环境变量
-    os.environ["CORE_SERVER_URL"] = args.core_server_url
-    if args.worker_id:
-        os.environ["WORKER_ID"] = args.worker_id
-    if args.convert_temp_path:
-        os.environ["CONVERT_TEMP_PATH"] = args.convert_temp_path
-    if args.archive_prepare_path:
-        os.environ["ARCHIVE_PREPARE_PATH"] = args.archive_prepare_path
-    if args.hndb_archive_path:
-        os.environ["HNDB_ARCHIVE_PATH"] = args.hndb_archive_path
     
     uvicorn.run(app, host=args.host, port=args.port)

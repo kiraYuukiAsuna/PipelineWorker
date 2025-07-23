@@ -2,10 +2,9 @@ import os
 
 CoreServerURL = "http://localhost:8000"
 
-ImageRootDirectory = "/PBshare/cloudForsftp/seusftp/upload"
+ImageRootDirectory = "./data"
 ImageTransferTemp = os.path.join(ImageRootDirectory, "transfer_temp")
-ImageProcessedFilesArchive = os.path.join(
-    ImageRootDirectory, "Processed_Files_Archive")
+ImageProcessedFilesArchive = os.path.join(ImageRootDirectory, "Processed_Files_Archive")
 
 HNDBRootDirectory = "./HNDB"
 SamplePreparationDirectory = os.path.join(HNDBRootDirectory, "HNDB_files", "SamplePreparation")
