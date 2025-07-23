@@ -11,8 +11,8 @@ def organize_image_files():
     # 确保目标基础目录存在
     os.makedirs(target_base_dir, exist_ok=True)
 
-    # 正则表达式匹配图像ID模式: P00134-T001-R001-S012-B1
-    pattern = r'(P\d+-T\d+-R\d+-S\d+-B\d+)'
+    # 正则表达式匹配图像ID模式: P00134-T001-R001-S012-B1-N1
+    pattern = r'(P\d+-T\d+-R\d+-S\d+(?:-B\d+)?(?:-\d+)?)'
 
     # 获取源目录中的所有文件
     try:
@@ -53,21 +53,46 @@ def organize_image_files():
                     ".pyramid.h5" in filename,
                     filename.endswith(".v3draw") and not "_" in filename.split(image_id)[1]
                 ])
+                # image id P095-T01-R01-S004-B1
+                # ptrs_id P095-T01-R01-S004 (remove -B1)
+                # 处理 docid，得到 ptrsid
+                docid = image_id
+                ptrsid = docid
+                docid_split = docid.split('-')
+                if len(docid_split) == 5: # P-T-R-S-B
+                    # 如果末位不是 Bxxx，则删去最后一个段
+                    if not docid_split[-1].startswith('B'):
+                        ptrsid = docid[0:-1 * (len(docid_split[4]) + 1)]
+                elif len(docid_split) == 6: # P-T-R-S-B-N
+                    ptrsid = docid[0:-1 * (len(docid_split[5]) + 1)]
+
+                if filename.endswith("_MIP.tif"):
+                    # 额外保存到样本目录
+                    sample_target_dir = os.path.join(cfg.SamplePreparationDirectory, ptrsid, image_id)
+                    os.makedirs(sample_target_dir, exist_ok=True)
+                    sample_target_path = os.path.join(sample_target_dir, filename)
+                    if not os.path.exists(sample_target_path):
+                        print(f"  复制: {filename} 到样本目录")
+                        shutil.copy(source_path, sample_target_path)
 
                 if is_valid_type:
-                    print(f"  复制: {filename}")
+                    print(f"  移动: {filename}")
                     shutil.move(source_path, target_path)
             except Exception as e:
-                print(f"  复制文件 {filename} 时出错: {e}")
+                print(f"  移动文件 {filename} 时出错: {e}")
 
     print("文件整理完成!")
 
 def ArchiveCommand():
     print("执行归档命令...")
-    shutil.move(
-        cfg.ImageProcessedFilesArchive,
-        cfg.ImageArchiveDirectory
-    )
+
+    for dirpath, dirnames, filenames in os.walk(cfg.ImageProcessedFilesArchive):
+        for dirname in dirnames:
+            shutil.move(
+                os.path.join(dirpath, dirname),
+                os.path.join(cfg.PTRSB_DBDirectory, dirname)
+            )
+
     print("归档命令执行完成!")
 
 if __name__ == "__main__":
