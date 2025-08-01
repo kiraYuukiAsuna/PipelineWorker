@@ -33,7 +33,7 @@ After=network.target
  
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=60 -o ExitOnForwardFailure=yes -o GatewayPorts=yes -L 8000:192.168.4.47:8000 root@172.16.1.123
+ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=60 -o ExitOnForwardFailure=yes -o GatewayPorts=yes -L 0.0.0.0:8000:192.168.4.47:8000 root@172.16.1.123
 Restart=always
 RestartSec=10
  
