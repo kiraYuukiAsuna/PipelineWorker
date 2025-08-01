@@ -18,7 +18,7 @@ import asyncio
 import subprocess
 import logging
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 from enum import Enum as PyEnum
@@ -26,8 +26,6 @@ from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 import uvicorn
 import config as cfg
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 import archive
 
 # 配置日志
@@ -153,7 +151,7 @@ class PipelineWorker:
             await self._notify_step_failed(pipeline_id, step_name, str(e))
             return {"status": "error", "error": str(e)}
     
-    async def _submit_sbatch_job(self, pipeline_id: str, step_name: str, h5_image_name: str) -> Optional[str]:
+    async def _submit_sbatch_job(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str]) -> Optional[str]:
         """提交 sbatch 作业"""
         try:
             # 根据步骤名称选择对应的处理脚本
@@ -219,8 +217,8 @@ class PipelineWorker:
 #SBATCH --job-name={step_name}_{pipeline_id}
 #SBATCH --output=/tmp/slurm_%j.out
 #SBATCH --error=/tmp/slurm_%j.err
-#SBATCH --partition=CPU
-#SBATCH --mem=50G
+#SBATCH --partition=normal
+#SBATCH --mem=250G
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
@@ -652,35 +650,99 @@ async def startup_event():
 def UploadFileWatcher():
     """
     监听cfg.ImageTransferTemp路径下的.h5文件上传
-    当检测到新的.h5文件时，触发相应的处理逻辑
+    使用轮询方式检测新的.h5文件，支持NFS挂载的文件系统
     """
     
-    class H5FileHandler(FileSystemEventHandler):
-        """H5文件事件处理器"""
+    class H5FilePollingWatcher:
+        """H5文件轮询监控器"""
         
-        def __init__(self):
-            super().__init__()
-            self.logger = logging.getLogger(f"{__name__}.H5FileHandler")
-        
-        def on_created(self, event):
-            """当文件被创建时触发"""
-            if os.path.isdir(event.src_path):
+        def __init__(self, watch_path: str, poll_interval: int = 5):
+            self.watch_path = watch_path
+            self.poll_interval = poll_interval
+            self.logger = logging.getLogger(f"{__name__}.H5FilePollingWatcher")
+            self.processed_files_json = "processed_h5_files.json"
+            self.is_running = True
+
+            # 确保监控目录存在
+            if not os.path.exists(self.watch_path):
+                self.logger.warning(f"监控路径不存在: {self.watch_path}")
                 return
 
-            file_path = event.src_path
-            if file_path.endswith('.h5'):
-                self.logger.info(f"检测到新的H5文件: {file_path}")
-                self._handle_h5_file(file_path)
+            self.logger.info(f"初始化H5文件轮询监控器，监控路径: {self.watch_path}")
         
-        def on_moved(self, event):
-            """当文件被移动时触发（可能是上传完成后的重命名）"""
-            if os.path.isdir(event.src_path):
-                return
-            
-            dest_path = event.dest_path
-            if dest_path.endswith('.h5'):
-                self.logger.info(f"检测到H5文件移动: {event.src_path} -> {dest_path}")
-                self._handle_h5_file(dest_path)
+        def _load_processed_files(self) -> Dict[str, str]:
+            """加载已处理文件记录"""
+            try:
+                if os.path.exists(self.processed_files_json):
+                    with open(self.processed_files_json, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                return {}
+            except Exception as e:
+                self.logger.error(f"加载已处理文件记录失败: {e}")
+                return {}
+
+        def _save_processed_files(self, processed_files: Dict[str, str]):
+            """保存已处理文件记录，同时清理30天前的记录"""
+            try:
+                # 清理30天前的记录
+                cutoff_date = (datetime.now() - timedelta(days=30)).isoformat()
+                cleaned_files = {
+                    filename: timestamp
+                    for filename, timestamp in processed_files.items()
+                    if timestamp > cutoff_date
+                }
+
+                # 保存到文件
+                with open(self.processed_files_json, 'w', encoding='utf-8') as f:
+                    json.dump(cleaned_files, f, ensure_ascii=False, indent=2)
+
+                cleaned_count = len(processed_files) - len(cleaned_files)
+                if cleaned_count > 0:
+                    self.logger.info(f"清理了 {cleaned_count} 个30天前的处理记录")
+
+            except Exception as e:
+                self.logger.error(f"保存已处理文件记录失败: {e}")
+
+        def _get_h5_files(self) -> List[str]:
+            """获取目录下所有.h5文件"""
+            try:
+                h5_files = []
+                for root, dirs, files in os.walk(self.watch_path):
+                    for file in files:
+                        if file.endswith('.h5'):
+                            file_path = os.path.join(root, file)
+                            h5_files.append(file_path)
+                return h5_files
+            except Exception as e:
+                self.logger.error(f"遍历H5文件时发生错误: {e}")
+                return []
+
+        def _is_file_stable(self, file_path: str, stability_checks: int = 3) -> bool:
+            """检查文件是否稳定（上传完成）"""
+            try:
+                if not os.path.exists(file_path):
+                    return False
+
+                # 获取初始文件大小
+                initial_size = os.path.getsize(file_path)
+                if initial_size == 0:
+                    return False
+
+                # 多次检查文件大小是否稳定
+                for _ in range(stability_checks):
+                    time.sleep(1)
+                    if not os.path.exists(file_path):
+                        return False
+
+                    current_size = os.path.getsize(file_path)
+                    if current_size != initial_size:
+                        return False
+
+                return True
+
+            except Exception as e:
+                self.logger.error(f"检查文件稳定性时发生错误: {e}")
+                return False
         
         def _handle_h5_file(self, file_path: str):
             """处理检测到的H5文件"""
@@ -691,9 +753,12 @@ def UploadFileWatcher():
                 file_name = os.path.basename(file_path)
                 self.logger.info(f"处理H5文件: {file_name}")
                 
-                # 等待文件上传完成（检查文件大小是否稳定）
-                if self._wait_for_file_stable(file_path):
-                    self.logger.info(f"H5文件上传完成: {file_name}")
+                # 检查文件是否稳定（上传完成）
+                if not self._is_file_stable(file_path):
+                    self.logger.debug(f"文件还在上传中，跳过: {file_name}")
+                    return
+
+                self.logger.info(f"H5文件上传完成: {file_name}")
                 
                 # 检查 worker 是否可用
                 if worker is None:
@@ -735,14 +800,25 @@ def UploadFileWatcher():
                                     pipeline_data = response.json()
                                     pipeline_id = pipeline_data["pipeline_id"]
                                     self.logger.info(f"✅ 流程创建成功！流程ID: {pipeline_id}")
+
+                                    # 记录已处理的文件
+                                    processed_files = self._load_processed_files()
+                                    processed_files[file_name] = datetime.now(
+                                    ).isoformat()
+                                    self._save_processed_files(processed_files)
+
+                                    return True
                                 else:
                                     self.logger.error(f"❌ 流程创建失败: {response.text}")
+                                    return False
                         
                         # 运行异步请求
-                        loop.run_until_complete(make_request())
+                        success = loop.run_until_complete(make_request())
+                        return success
                         
                     except Exception as e:
                         self.logger.error(f"创建流程时发生错误: {e}")
+                        return False
                     finally:
                         if loop is not None:
                             try:
@@ -754,97 +830,63 @@ def UploadFileWatcher():
                 thread = threading.Thread(target=create_pipeline_async)
                 thread.daemon = True
                 thread.start()
+                thread.join(timeout=60)  # 等待最多60秒
                             
             except Exception as e:
                 self.logger.error(f"处理H5文件时发生错误: {e}")
         
-        def _wait_for_file_stable(self, file_path: str, max_wait_time: int = 30) -> bool:
-            """等待文件大小稳定，确认上传完成"""
-            try:
-                if not os.path.exists(file_path):
-                    return False
-                
-                prev_size = -1
-                stable_count = 0
-                wait_time = 0
-                
-                while wait_time < max_wait_time:
+        def start_polling(self):
+            """开始轮询监控"""
+            self.logger.info(f"开始轮询监控H5文件，间隔: {self.poll_interval}秒")
+
+            def polling_loop():
+                """轮询循环"""
+                while self.is_running:
                     try:
-                        current_size = os.path.getsize(file_path)
+                        # 加载已处理文件记录
+                        processed_files = self._load_processed_files()
                         
-                        if current_size == prev_size and current_size > 0:
-                            stable_count += 1
-                            if stable_count >= 3:  # 连续3次大小相同认为稳定
-                                return True
-                        else:
-                            stable_count = 0
+                        # 获取当前目录下的所有H5文件
+                        current_files = self._get_h5_files()
                         
-                        prev_size = current_size
-                        time.sleep(1)
-                        wait_time += 1
-                        
-                    except OSError:
-                        # 文件可能还在写入中
-                        time.sleep(1)
-                        wait_time += 1
-                        continue
-                
-                return False
-                
-            except Exception as e:
-                self.logger.error(f"检查文件稳定性时发生错误: {e}")
-                return False
-        
-        async def _notify_new_file(self, file_name: str, file_path: str):
-            """通知有新文件上传"""
-            try:
-                # 如果worker实例存在，可以通过它来通知core server
-                global worker
-                if worker and not worker.http_client.is_closed:
-                    # 构造通知数据
-                    notification_data = {
-                        "event_type": "new_h5_file",
-                        "file_name": file_name,
-                        "file_path": file_path,
-                        "file_size": os.path.getsize(file_path),
-                        "timestamp": datetime.now().isoformat(),
-                        "worker_id": worker.worker_id
-                    }
-                    
-                    # 发送通知到core server
-                    url = f"{worker.core_server_url}/api/files/notification"
-                    try:
-                        response = await worker.http_client.post(url, json=notification_data)
-                        if response.status_code == 200:
-                            self.logger.info(f"新文件通知发送成功: {file_name}")
-                        else:
-                            self.logger.warning(f"新文件通知发送失败: {response.status_code}")
+                        # 检查新文件
+                        for file_path in current_files:
+                            file_name = os.path.basename(file_path)
+
+                            # 检查是否已经处理过
+                            if file_name not in processed_files:
+                                self.logger.info(f"发现新的H5文件: {file_name}")
+                                self._handle_h5_file(file_path)
+
+                        # 等待下次轮询
+                        time.sleep(self.poll_interval)
+
                     except Exception as e:
-                        self.logger.error(f"发送新文件通知时发生错误: {e}")
-                        # 如果是因为事件循环关闭导致的错误，记录但不重试
-                        if "Event loop is closed" in str(e):
-                            self.logger.debug("检测到事件循环已关闭，停止新文件通知")
-                else:
-                    self.logger.debug("Worker 实例不可用或 HTTP 客户端已关闭，跳过新文件通知")
-                        
-            except Exception as e:
-                self.logger.error(f"通知新文件时发生错误: {e}")
+                        self.logger.error(f"轮询过程中发生错误: {e}")
+                        time.sleep(self.poll_interval)
+
+            # 在后台线程中运行轮询
+            import threading
+            self.polling_thread = threading.Thread(target=polling_loop)
+            self.polling_thread.daemon = True
+            self.polling_thread.start()
+
+        def stop(self):
+            """停止轮询监控"""
+            self.is_running = False
+            self.logger.info("H5文件轮询监控已停止")
     
-    # 创建文件监控
+    # 创建并启动轮询监控器
     watch_path = cfg.ImageTransferTemp
     
     if not os.path.exists(watch_path):
         logger.warning(f"监控路径不存在: {watch_path}")
         return None
     
-    event_handler = H5FileHandler()
-    observer = Observer()
-    observer.schedule(event_handler, watch_path, recursive=True)
+    watcher = H5FilePollingWatcher(watch_path)
+    watcher.start_polling()
     
-    logger.info(f"开始监控H5文件上传，监控路径: {watch_path}")
-    observer.start()
-    
-    return observer
+    return watcher
 
 
 @app.on_event("shutdown")
@@ -855,7 +897,6 @@ async def shutdown_event():
     # 停止文件监控器
     if file_observer:
         file_observer.stop()
-        file_observer.join()
         logger.info("文件监控器已停止")
     
     # 关闭worker
@@ -921,9 +962,9 @@ async def get_file_watcher_status():
         }
     
     return {
-        "status": "running" if file_observer.is_alive() else "stopped",
+        "status": "running" if file_observer.is_running else "stopped",
         "watch_path": cfg.ImageTransferTemp,
-        "is_alive": file_observer.is_alive(),
+        "is_running": file_observer.is_running,
         "timestamp": datetime.now().isoformat()
     }
 
