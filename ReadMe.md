@@ -26,17 +26,21 @@ ssh -o PasswordAuthentication=no root@172.16.1.123 "echo SSH key authentication 
 # Step 3: Update the SSH Tunnel Service
 If the previous steps were successful, update the service:
 
+在此之前先保证跳板机sudo vim /etc/ssh/sshd_config
+中的配置项为GatewayPorts yes 
+
 sudo bash -c 'cat > /etc/systemd/system/ssh-tunnel.service << EOF
 [Unit]
-Description=SSH tunnel for service access
+Description=SSH tunnel for bidirectional service access
 After=network.target
- 
+
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=60 -o ExitOnForwardFailure=yes -o GatewayPorts=yes -L 0.0.0.0:8000:192.168.4.47:8000 root@172.16.1.123
+# 添加-R参数创建反向隧道，假设slurm需要暴露7000端口(根据实际需要调整)
+ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=60 -o ExitOnForwardFailure=yes -o GatewayPorts=yes -L 0.0.0.0:8000:192.168.4.47:8000 -R 0.0.0.0:7000:172.16.1.100:7000 root@172.16.1.123
 Restart=always
 RestartSec=10
- 
+
 [Install]
 WantedBy=multi-user.target
 EOF'
