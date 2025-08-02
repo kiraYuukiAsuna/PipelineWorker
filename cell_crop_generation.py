@@ -260,8 +260,12 @@ if __name__ == '__main__':
         "P00131-T001-R001-S002-B1.pyramid.h5",
     ]
 
+    images.reverse()
     for h5_image_name in images:
         print(f"Processing: {h5_image_name}")
-        main(h5_image_name)
+        try:
+            main(h5_image_name)
+        except Exception as e:
+            print(f"Error processing {h5_image_name}: {e}")
 
     print("All images processed.")
