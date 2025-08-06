@@ -168,7 +168,17 @@ def main(h5_image_name):
         # 保存结果的目录
         outsdir = os.path.join(topbd, fp2dbdirs(this_sid))
         if not os.path.exists(outsdir):
-            os.makedirs(outsdir)
+            print('Create directory:', outsdir)
+            try:
+                os.makedirs(outsdir, exist_ok=True)
+                print(f'Successfully created directory: {outsdir}')
+            except PermissionError:
+                print(f'Permission denied: Cannot create directory {outsdir}')
+                print('Please check if you have write permissions to this path')
+                continue
+            except Exception as e:
+                print(f'Error creating directory {outsdir}: {e}')
+                continue
         
         out_file = os.path.join(outsdir, str(this_sid) + '.v3dpbd')
         if not os.path.exists(out_file):

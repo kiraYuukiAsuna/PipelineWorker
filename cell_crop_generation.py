@@ -170,7 +170,17 @@ def main(h5_image_name):
         # 保存结果的目录
         outsdir = os.path.join(topbd, fp2dbdirs(this_sid))
         if not os.path.exists(outsdir):
-            os.makedirs(outsdir)
+            print('Create directory:', outsdir)
+            try:
+                os.makedirs(outsdir, exist_ok=True)
+                print(f'Successfully created directory: {outsdir}')
+            except PermissionError:
+                print(f'Permission denied: Cannot create directory {outsdir}')
+                print('Please check if you have write permissions to this path')
+                continue
+            except Exception as e:
+                print(f'Error creating directory {outsdir}: {e}')
+                continue
 
         out_file = os.path.join(outsdir, str(this_sid) + '.v3dpbd')
         if not os.path.exists(out_file):
@@ -184,14 +194,35 @@ def main(h5_image_name):
             out_mip_dir = os.path.join(
                 cfg.Cell_MIPsDirectory, fp2dbdirs(this_sid))
             if not os.path.exists(out_mip_dir):
-                os.makedirs(out_mip_dir)
-            mip_file = os.path.join(out_mip_dir, str(this_sid) + '.tif')
-            if not os.path.exists(mip_file):
-                # 计算 MIP 图像 Z 方向的最大投影
-                mip_img = np.max(cropped_img, axis=1)  # 在 Z 轴上进行最大投影
-                # 保存 MIP 图像
-                from skimage import io
-                io.imsave(mip_file, mip_img.astype(np.uint8))
+                try:
+                    os.makedirs(out_mip_dir, exist_ok=True)
+                    print(f'Successfully created MIP directory: {out_mip_dir}')
+                except PermissionError:
+                    print(
+                        f'Permission denied: Cannot create MIP directory {out_mip_dir}')
+                    print('Skipping MIP generation for this cell')
+                except Exception as e:
+                    print(f'Error creating MIP directory {out_mip_dir}: {e}')
+                    print('Skipping MIP generation for this cell')
+                else:
+                    # 只有在成功创建目录后才生成 MIP
+                    mip_file = os.path.join(
+                        out_mip_dir, str(this_sid) + '.tif')
+                    if not os.path.exists(mip_file):
+                        # 计算 MIP 图像 Z 方向的最大投影
+                        mip_img = np.max(cropped_img, axis=1)  # 在 Z 轴上进行最大投影
+                        # 保存 MIP 图像
+                        from skimage import io
+                        io.imsave(mip_file, mip_img.astype(np.uint8))
+            else:
+                # 目录已存在，直接生成 MIP
+                mip_file = os.path.join(out_mip_dir, str(this_sid) + '.tif')
+                if not os.path.exists(mip_file):
+                    # 计算 MIP 图像 Z 方向的最大投影
+                    mip_img = np.max(cropped_img, axis=1)  # 在 Z 轴上进行最大投影
+                    # 保存 MIP 图像
+                    from skimage import io
+                    io.imsave(mip_file, mip_img.astype(np.uint8))
 
         # 递增 cell_id
         this_sid += 1
