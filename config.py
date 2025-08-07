@@ -12,3 +12,5 @@ SamplePreparationDirectory = os.path.join(HNDBRootDirectory, "HNDB_files", "Samp
 Cell_ImagesDirectory = os.path.join(HNDBRootDirectory, "Cell_Images")
 Cell_MIPsDirectory = os.path.join(HNDBRootDirectory, "Cell_MIPs")
 PTRSB_DBDirectory = os.path.join(HNDBRootDirectory, "PTRSB_DB")
+
+SlurmScriptPath = "/public/home/RuilongWang/PipelineWorker/slurm_script"

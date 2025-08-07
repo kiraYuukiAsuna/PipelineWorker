@@ -180,14 +180,22 @@ class PipelineWorker:
             elif step_name == "downsample" and image_name:
                 image_name = image_name.replace('.pyramid.h5', '_8bit.v3draw')
 
+            temp_script_root_path = cfg.SlurmScriptPath
+            os.makedirs(temp_script_root_path, exist_ok=True)
+
             # 构建 sbatch 命令
-            sbatch_script = self._generate_sbatch_script(pipeline_id, step_name, script_path, image_name)
-            
+            sbatch_script = self._generate_sbatch_script(
+                pipeline_id, step_name, script_path, image_name, temp_script_root_path)
+
             # 写入临时脚本文件
-            temp_script_path = f"/tmp/sbatch_{pipeline_id}_{step_name}_{int(time.time())}.sh"
+            temp_script_path = f"{temp_script_root_path}/sbatch_{pipeline_id}_{step_name}_{int(time.time())}.sh"
             with open(temp_script_path, 'w') as f:
                 f.write(sbatch_script)
-            
+
+            # chmod +x 使脚本可执行
+            os.chmod(temp_script_path, 0o755)
+            logger.info(f"提交 sbatch 作业: {temp_script_path}")
+
             # 提交作业
             cmd = ["sbatch", temp_script_path]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -208,15 +216,15 @@ class PipelineWorker:
         except Exception as e:
             logger.error(f"提交 sbatch 作业时发生错误: {e}")
             return None
-    
-    def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, image_name: str) -> str:
+
+    def _generate_sbatch_script(self, pipeline_id: str, step_name: str, script_path: str, image_name: str, temp_script_root_path: str) -> str:
         """生成 sbatch 脚本内容"""
         image_path = os.path.join(cfg.ImageTransferTemp, image_name if image_name else "") 
 
         return f"""#!/bin/bash
 #SBATCH --job-name={step_name}_{pipeline_id}
-#SBATCH --output=/tmp/slurm_%j.out
-#SBATCH --error=/tmp/slurm_%j.err
+#SBATCH --output={temp_script_root_path}/slurm_%j.out
+#SBATCH --error={temp_script_root_path}/slurm_%j.err
 #SBATCH --partition=normal
 #SBATCH --mem=250G
 #SBATCH --nodes=1
