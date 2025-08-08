@@ -390,7 +390,7 @@ def Batch_Convert16bitTo8bit(input_dir, scaling_method='minmax', use_chunked=Tru
 
 def Single_Convert16bitTo8bit(input_file, output_file=None, 
                              scaling_method='minmax', use_chunked=True, 
-                             chunk_size_mb=512):
+                             chunk_size_mb=1024):
     """
     单个文件16位到8位转换入口函数
 

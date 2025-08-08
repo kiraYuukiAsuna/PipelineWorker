@@ -225,11 +225,12 @@ class PipelineWorker:
 #SBATCH --job-name={step_name}_{pipeline_id}
 #SBATCH --output={temp_script_root_path}/slurm_%j.out
 #SBATCH --error={temp_script_root_path}/slurm_%j.err
+#SBATCH --qos=pbstorageaccess
 #SBATCH --partition=normal
 #SBATCH --mem=250G
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
+#SBATCH --cpus-per-task=8
 #SBATCH --ntasks-per-node=1
 
 # 设置环境变量
