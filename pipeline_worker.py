@@ -97,6 +97,9 @@ class PipelineWorker:
         # 存储正在运行的作业
         self.running_jobs: Dict[str, JobInfo] = {}
         
+        # 持久化文件路径
+        self.running_jobs_file = "running_jobs.json"
+
         # HTTP 客户端
         self.http_client = httpx.AsyncClient(timeout=30.0)
         
@@ -106,7 +109,108 @@ class PipelineWorker:
         # 后台任务
         self.background_tasks: List[asyncio.Task] = []
         
+        # 启动时加载已运行的任务
+        self._load_running_jobs()
+
         logger.info(f"Pipeline Worker 初始化完成，Worker ID: {self.worker_id}")
+
+    def _save_running_jobs(self):
+        """保存正在运行的任务到文件"""
+        try:
+            jobs_data = {}
+            for job_key, job_info in self.running_jobs.items():
+                jobs_data[job_key] = {
+                    "job_id": job_info.job_id,
+                    "pipeline_id": job_info.pipeline_id,
+                    "step_name": job_info.step_name,
+                    "submit_time": job_info.submit_time.isoformat(),
+                    "last_check_time": job_info.last_check_time.isoformat(),
+                    "h5_image_name": job_info.h5_image_name,
+                    "status": job_info.status
+                }
+
+            with open(self.running_jobs_file, 'w', encoding='utf-8') as f:
+                json.dump(jobs_data, f, ensure_ascii=False, indent=2)
+
+            logger.debug(
+                f"已保存 {len(jobs_data)} 个运行中的任务到 {self.running_jobs_file}")
+
+        except Exception as e:
+            logger.error(f"保存运行中任务失败: {e}")
+
+    def _load_running_jobs(self):
+        """从文件加载正在运行的任务"""
+        try:
+            if not os.path.exists(self.running_jobs_file):
+                logger.info("未找到已保存的运行任务文件")
+                return
+
+            with open(self.running_jobs_file, 'r', encoding='utf-8') as f:
+                jobs_data = json.load(f)
+
+            for job_key, job_data in jobs_data.items():
+                job_info = JobInfo(
+                    job_id=job_data["job_id"],
+                    pipeline_id=job_data["pipeline_id"],
+                    step_name=job_data["step_name"],
+                    submit_time=datetime.fromisoformat(
+                        job_data["submit_time"]),
+                    last_check_time=datetime.fromisoformat(
+                        job_data["last_check_time"]),
+                    h5_image_name=job_data.get("h5_image_name"),
+                    status=job_data["status"]
+                )
+                self.running_jobs[job_key] = job_info
+
+            logger.info(f"从文件恢复了 {len(jobs_data)} 个运行中的任务")
+
+        except Exception as e:
+            logger.error(f"加载运行中任务失败: {e}")
+
+    async def _verify_recovered_jobs(self):
+        """验证恢复的任务是否仍在运行"""
+        try:
+            # 等待一小段时间确保系统完全启动
+            await asyncio.sleep(5)
+
+            jobs_to_remove = []
+
+            for job_key, job_info in list(self.running_jobs.items()):
+                logger.info(
+                    f"验证恢复的任务: {job_info.job_id} ({job_info.pipeline_id}/{job_info.step_name})")
+
+                # 检查任务状态
+                current_status = await self._check_job_status(job_info)
+
+                if current_status in ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"]:
+                    logger.info(
+                        f"恢复的任务已完成: {job_info.job_id} -> {current_status}")
+                    await self._handle_job_completion(job_info, current_status)
+                    jobs_to_remove.append(job_key)
+                else:
+                    logger.info(
+                        f"恢复的任务仍在运行: {job_info.job_id} -> {current_status}")
+                    job_info.status = current_status
+                    job_info.last_check_time = datetime.now()
+
+            # 移除已完成的任务
+            for job_key in jobs_to_remove:
+                del self.running_jobs[job_key]
+
+            # 保存更新后的任务状态
+            self._save_running_jobs()
+
+        except Exception as e:
+            logger.error(f"验证恢复的任务时发生错误: {e}")
+
+    def _cleanup_running_jobs_file(self):
+        """清理运行任务文件"""
+        try:
+            if os.path.exists(self.running_jobs_file):
+                os.remove(self.running_jobs_file)
+                logger.debug(f"已清理运行任务文件: {self.running_jobs_file}")
+        except Exception as e:
+            logger.error(f"清理运行任务文件失败: {e}")
 
     async def start_step(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> dict:
         """开始执行处理步骤"""
@@ -134,6 +238,9 @@ class PipelineWorker:
                 )
                 self.running_jobs[job_key] = job_info
                 
+                # 保存新任务到文件
+                self._save_running_jobs()
+
                 # 通知 core_server_api 步骤已开始
                 await self._notify_step_started(pipeline_id, step_name, job_id)
                 
@@ -293,7 +400,10 @@ python3 {script_path} --image-path "{image_path}"
                         
                         # 更新进度
                         await self._update_job_progress(job_info, current_status)
-                    
+
+                        # 保存状态变化到文件
+                        self._save_running_jobs()
+
                     # 处理已完成或失败的作业
                     final_states = ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"]
                     if current_status in final_states:
@@ -306,6 +416,10 @@ python3 {script_path} --image-path "{image_path}"
                 for job_key in jobs_to_remove:
                     del self.running_jobs[job_key]
                 
+                # 如果有任务被移除，更新保存的任务文件
+                if jobs_to_remove:
+                    self._save_running_jobs()
+
                 await asyncio.sleep(self.job_check_interval)
                 
             except Exception as e:
@@ -401,9 +515,19 @@ python3 {script_path} --image-path "{image_path}"
                     elif job_info.step_name == "mip_generation":
                         # Archive files sequentially - ensure organize_image_files completes before ArchiveCommand
                         # Using await asyncio.to_thread to run blocking functions without blocking the event loop
-                        await asyncio.to_thread(archive.organize_image_files)
+                        # 提取图像ID用于单文件处理
+                        h5_image_name = job_info.h5_image_name if job_info.h5_image_name else ""
+
+                        # 从h5文件名中提取图像ID
+                        import re
+                        pattern = r'(P\d+-T\d+-R\d+-S\d+(?:-B\d+)?(?:-\d+)?)'
+                        match = re.search(pattern, h5_image_name)
+                        image_id = match.group(1) if match else None
+
+                        # 只处理当前文件相关的文件
+                        await asyncio.to_thread(archive.organize_image_files, h5_image_name)
                         # Only execute ArchiveCommand after organize_image_files is complete
-                        await asyncio.to_thread(archive.ArchiveCommand)
+                        await asyncio.to_thread(archive.ArchiveCommand, image_id)
 
                 # 调用完成API
                 url = f"{self.core_server_url}/api/pipeline/{job_info.pipeline_id}/step/{job_info.step_name}/complete"
@@ -619,6 +743,10 @@ python3 {script_path} --image-path "{image_path}"
             await self.http_client.aclose()
             logger.info("HTTP 客户端已关闭")
         
+        # 清理运行任务文件（如果没有运行中的任务）
+        if not self.running_jobs:
+            self._cleanup_running_jobs_file()
+
         logger.info("Pipeline Worker 已关闭")
 
 # FastAPI 应用
@@ -647,8 +775,12 @@ async def startup_event():
     monitor_task = asyncio.create_task(worker._monitor_jobs())
     heartbeat_task = asyncio.create_task(worker._send_heartbeat())
     
-    # 保存任务引用以便稍后管理
-    worker.background_tasks = [monitor_task, heartbeat_task]
+    # 验证恢复的任务
+    if worker.running_jobs:
+        verify_task = asyncio.create_task(worker._verify_recovered_jobs())
+        worker.background_tasks = [monitor_task, heartbeat_task, verify_task]
+    else:
+        worker.background_tasks = [monitor_task, heartbeat_task]
     
     # 启动文件监控器
     file_observer = UploadFileWatcher()

@@ -37,7 +37,7 @@ class DataAccess:
         获取单个 document 的三维数据
         :return: np.array 形状 (c, z, y, x)
         """
-        imgpath = os.path.join(self.img_dir, ptrsid, docid + '_8bit.v3draw')
+        imgpath = os.path.join(self.img_dir, docid, docid + '_8bit.v3draw')
         if not os.path.exists(imgpath):
             print(f"Can not find image file: {imgpath}")
             return None
@@ -47,25 +47,37 @@ class DataAccess:
 
 
 def fp2dbdirs(strcid):
-        '''convert file path to Database dirs'''
-        # fname = os.path.split(file_path)[-1]
-        # strcid = fname.split(".")[0]
-        cid = int(strcid)
-        # first layer of dir : 1000
-        minb = int(cid / 1000) * 1000
-        maxb = (int(cid / 1000) + 1) * 1000 - 1
-        str_minb = ('00000' + str(minb))[-5:]
-        str_maxb = ('00000' + str(maxb))[-5:]
-        fdir = str_minb + '_' + str_maxb
-        # second layer of dir : 100
-        layer_base = int(cid / 1000) * 1000
-        minb1 = layer_base + int((cid - layer_base) / 100) * 100
-        maxb1 = layer_base + int((cid - layer_base) / 100 + 1) * 100 - 1
-        str_minb1 = ('00000' + str(minb1))[-5:]
-        str_maxb1 = ('00000' + str(maxb1))[-5:]
-        fdir1 = str_minb1 + '_' + str_maxb1
-        todir2 = os.path.join(fdir, fdir1)
-        return todir2
+    '''convert file path to Database dirs with dynamic directory name length'''
+    cid = int(strcid)
+
+    # 获取必要的数字长度（根据最大值确定）
+    # first layer of dir: groups of 1000
+    minb = int(cid / 1000) * 1000
+    maxb = (int(cid / 1000) + 1) * 1000 - 1
+
+    # 确定需要的位数
+    digits_needed = max(len(str(maxb)), len(str(minb)))
+
+    # 格式化目录名
+    str_minb = str(minb).zfill(digits_needed)
+    str_maxb = str(maxb).zfill(digits_needed)
+    fdir = str_minb + '_' + str_maxb
+
+    # second layer of dir: groups of 100
+    layer_base = int(cid / 1000) * 1000
+    minb1 = layer_base + int((cid - layer_base) / 100) * 100
+    maxb1 = layer_base + int((cid - layer_base) / 100 + 1) * 100 - 1
+
+    # 确定二级目录需要的位数
+    digits_needed1 = max(len(str(maxb1)), len(str(minb1)))
+
+    # 格式化二级目录名
+    str_minb1 = str(minb1).zfill(digits_needed1)
+    str_maxb1 = str(maxb1).zfill(digits_needed1)
+    fdir1 = str_minb1 + '_' + str_maxb1
+
+    todir2 = os.path.join(fdir, fdir1)
+    return todir2
 
 
 def main(h5_image_name):

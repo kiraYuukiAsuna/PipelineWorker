@@ -1,0 +1,20 @@
+{
+  "pipeline1_mip_generation": {
+    "job_id": "12345",
+    "pipeline_id": "pipeline1",
+    "step_name": "mip_generation",
+    "submit_time": "2025-08-08T10:00:00",
+    "last_check_time": "2025-08-08T10:30:00",
+    "h5_image_name": "test_image.pyramid.h5",
+    "status": "RUNNING"
+  },
+  "pipeline2_bit_conversion": {
+    "job_id": "12346",
+    "pipeline_id": "pipeline2",
+    "step_name": "bit_conversion",
+    "submit_time": "2025-08-08T10:15:00",
+    "last_check_time": "2025-08-08T10:30:00",
+    "h5_image_name": "another_image.pyramid.h5",
+    "status": "PENDING"
+  }
+}
