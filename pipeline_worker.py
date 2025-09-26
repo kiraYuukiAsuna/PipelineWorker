@@ -44,6 +44,7 @@ class StartStepRequest(BaseModel):
     pipeline_id: str
     step_name: str
     h5_image_name: str
+    force_restart: bool
 
 class StepStatusEnum(str, PyEnum):
     """步骤状态枚举"""
@@ -212,14 +213,14 @@ class PipelineWorker:
         except Exception as e:
             logger.error(f"清理运行任务文件失败: {e}")
 
-    async def start_step(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None) -> dict:
+    async def start_step(self, pipeline_id: str, step_name: str, h5_image_name: Optional[str] = None, force_restart: bool = False) -> dict:
         """开始执行处理步骤"""
         try:
             logger.info(f"开始执行步骤: {pipeline_id}/{step_name}")
             
             # 检查是否已有该步骤在运行
             job_key = f"{pipeline_id}_{step_name}"
-            if job_key in self.running_jobs:
+            if job_key in self.running_jobs and not force_restart:
                 logger.warning(f"步骤 {pipeline_id}/{step_name} 已在运行中")
                 return {"status": "already_running", "job_id": self.running_jobs[job_key].job_id}
             
@@ -1054,7 +1055,7 @@ async def start_step_endpoint(
         raise HTTPException(status_code=500, detail="Worker 未初始化")
     
     # 同步处理步骤开始，以便返回准确的状态
-    result = await worker.start_step(request.pipeline_id, request.step_name, request.h5_image_name)
+    result = await worker.start_step(request.pipeline_id, request.step_name, request.h5_image_name, request.force_restart)
     
     # 根据返回结果构造响应
     if result["status"] == "already_running":
