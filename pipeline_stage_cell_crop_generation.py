@@ -113,8 +113,10 @@ def main(h5_image_name):
 
     if h5_image_name.endswith(".pyramid.h5"):
         docid = h5_image_name.replace(".pyramid.h5", "")
-    else:
+    elif h5_image_name.endswith(".h5"):
         docid = h5_image_name.replace(".h5", "")
+    else:
+        docid = h5_image_name
 
     # 处理 docid，得到 ptrsid
     ptrsid = docid

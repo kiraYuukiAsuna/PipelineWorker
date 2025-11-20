@@ -1,3 +1,4 @@
+# coding=utf-8
 """
 Pipeline Worker - 图像处理流程工作器
 负责接收任务、提交sbatch作业、监控状态并与hndb api交互
@@ -301,7 +302,7 @@ class PipelineWorker:
                 f.write(sbatch_script)
 
             # chmod +x 使脚本可执行
-            os.chmod(temp_script_path, 0o755)
+            os.chmod(temp_script_path, 0o775)
             logger.info(f"提交 sbatch 作业: {temp_script_path}")
 
             # 提交作业
@@ -350,7 +351,7 @@ export CORE_SERVER_URL={self.core_server_url}
 # 执行处理脚本
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate HumanDatabaseTools
-python3 {script_path} --image-path "{image_path}"
+~/miniconda3/envs/HumanDatabaseTools/bin/python3 {script_path} --image-path "{image_path}"
 """
     
     async def _check_job_status(self, job_info: JobInfo) -> str:
