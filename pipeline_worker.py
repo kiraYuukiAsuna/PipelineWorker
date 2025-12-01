@@ -82,6 +82,7 @@ class JobInfo:
     last_check_time: datetime
     h5_image_name: Optional[str] = None
     status: str = "PENDING"
+    retry_count: int = 0
 
 class PipelineWorker:
     """Pipeline Worker 主类"""
@@ -128,7 +129,8 @@ class PipelineWorker:
                     "submit_time": job_info.submit_time.isoformat(),
                     "last_check_time": job_info.last_check_time.isoformat(),
                     "h5_image_name": job_info.h5_image_name,
-                    "status": job_info.status
+                    "status": job_info.status,
+                    "retry_count": job_info.retry_count
                 }
 
             with open(self.running_jobs_file, 'w', encoding='utf-8') as f:
@@ -160,7 +162,8 @@ class PipelineWorker:
                     last_check_time=datetime.fromisoformat(
                         job_data["last_check_time"]),
                     h5_image_name=job_data.get("h5_image_name"),
-                    status=job_data["status"]
+                    status=job_data["status"],
+                    retry_count=job_data.get("retry_count", 0)
                 )
                 self.running_jobs[job_key] = job_info
 
@@ -409,8 +412,9 @@ conda activate HumanDatabaseTools
                     # 处理已完成或失败的作业
                     final_states = ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY"]
                     if current_status in final_states:
-                        await self._handle_job_completion(job_info, current_status)
-                        jobs_to_remove.append(job_key)
+                        should_remove = await self._handle_job_completion(job_info, current_status)
+                        if should_remove:
+                            jobs_to_remove.append(job_key)
                     
                     job_info.last_check_time = datetime.now()
                 
@@ -474,13 +478,13 @@ conda activate HumanDatabaseTools
                 logger.debug("检测到事件循环已关闭，停止进度更新")
                 return
     
-    async def _handle_job_completion(self, job_info: JobInfo, final_status: str):
-        """处理作业完成"""
+    async def _handle_job_completion(self, job_info: JobInfo, final_status: str) -> bool:
+        """处理作业完成。返回 True 表示任务结束(成功或失败且无重试)，可以移除; False 表示正在重试，保留任务"""
         try:
             # 检查 worker 是否仍在运行且 http_client 可用
             if not self.is_running or self.http_client.is_closed:
                 logger.debug(f"跳过作业完成处理，worker 已关闭或 http_client 不可用: {job_info.job_id}")
-                return
+                return True
                 
             if final_status == "COMPLETED":
                 # 根据步骤名称组成对应的文件名
@@ -513,7 +517,7 @@ conda activate HumanDatabaseTools
                             job_info.step_name,
                             error_message
                         )
-                        return
+                        return True
                     elif job_info.step_name == "mip_generation":
                         # Archive files sequentially - ensure organize_image_files completes before ArchiveCommand
                         # Using await asyncio.to_thread to run blocking functions without blocking the event loop
@@ -543,9 +547,46 @@ conda activate HumanDatabaseTools
                     logger.info(f"步骤完成通知发送成功: {job_info.pipeline_id}/{job_info.step_name}")
                 else:
                     logger.warning(f"步骤完成通知发送失败: {response.status_code}")
+
+                return True
             else:
+                # 检查是否可以重试
+                if job_info.retry_count < 2:
+                    logger.info(
+                        f"作业失败: {job_info.job_id} (状态: {final_status}), 尝试重试 ({job_info.retry_count + 1}/2)")
+
+                    # 重新提交作业
+                    new_job_id = await self._submit_sbatch_job(
+                        job_info.pipeline_id,
+                        job_info.step_name,
+                        job_info.h5_image_name
+                    )
+
+                    if new_job_id:
+                        # 更新作业信息
+                        job_info.job_id = new_job_id
+                        job_info.status = "PENDING"
+                        job_info.retry_count += 1
+                        job_info.submit_time = datetime.now()
+                        job_info.last_check_time = datetime.now()
+
+                        # 保存更新后的状态
+                        self._save_running_jobs()
+
+                        # 通知 core_server_api 步骤重新开始 (可选，或者保持 RUNNING 状态)
+                        # 这里我们选择发送一个新的 started 通知，更新 job_id
+                        await self._notify_step_started(job_info.pipeline_id, job_info.step_name, new_job_id)
+
+                        return False  # 不移除任务，继续监控
+                    else:
+                        logger.error(
+                            f"重试提交作业失败: {job_info.pipeline_id}/{job_info.step_name}")
+                        # 提交失败，继续执行失败通知逻辑
+
                 # 构建详细的错误信息
                 error_message = f"SLURM作业失败 - 作业ID: {job_info.job_id}, 最终状态: {final_status}"
+                if job_info.retry_count > 0:
+                    error_message += f" (已重试 {job_info.retry_count} 次)"
                 
                 # 尝试获取更详细的错误信息
                 try:
@@ -562,8 +603,11 @@ conda activate HumanDatabaseTools
                     error_message
                 )
                 
+                return True
+
         except Exception as e:
             logger.error(f"处理作业完成时发生错误: {e}")
+            return True
     
     async def _notify_step_started(self, pipeline_id: str, step_name: str, job_id: str):
         """通知步骤已开始"""
