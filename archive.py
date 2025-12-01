@@ -36,6 +36,8 @@ def organize_image_files(target_h5_filename=None):
     # 按图像ID组织文件
     image_files = {}
     for filename in files:
+        if not os.path.isfile(os.path.join(source_dir, filename)):
+            continue
         match = re.search(pattern, filename)
         if match:
             image_id = match.group(1)

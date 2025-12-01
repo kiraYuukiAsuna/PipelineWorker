@@ -492,7 +492,7 @@ python3 {script_path} --image-path "{image_path}"
                 }
 
 
-                file_to_check = script_mapping.get(job_info.step_name, "")
+                file_to_check = script_mapping.get(job_info.step_name, "fake_file.xyz")
                 if file_to_check != "":
                     if not os.path.exists(os.path.join(cfg.ImageTransferTemp, file_to_check)):
                         # 构建详细的错误信息
