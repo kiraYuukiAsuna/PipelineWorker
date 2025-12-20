@@ -496,8 +496,7 @@ conda activate HumanDatabaseTools
                     "downsample": f"{h5_image_name.replace('.pyramid.h5', '_8bit_downsampled.v3draw')}",
                 }
 
-
-                file_to_check = script_mapping.get(job_info.step_name, "fake_file.xyz")
+                file_to_check = script_mapping.get(job_info.step_name, "")
                 if file_to_check != "":
                     if not os.path.exists(os.path.join(cfg.ImageTransferTemp, file_to_check)):
                         # 构建详细的错误信息
