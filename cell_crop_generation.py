@@ -149,6 +149,7 @@ def main(h5_image_name):
 
     # 对每个 soma 坐标进行裁剪操作
     for s in somalist.index:
+        print(f"Processing cell at location: x={somalist.loc[s, 'x']}, y={somalist.loc[s, 'y']}, z={somalist.loc[s, 'z']}")
         sx = int(float(somalist.loc[s, 'x']))
         sy = int(float(somalist.loc[s, 'y']))
         sz = int(float(somalist.loc[s, 'z']))
@@ -223,7 +224,9 @@ def main(h5_image_name):
                     # 保存 MIP 图像
                     from skimage import io
                     io.imsave(mip_file, mip_img.astype(np.uint8))
-
+        else:
+            print('File already exists, skipping save:', out_file)
+            
         # 递增 cell_id
         this_sid += 1
 
